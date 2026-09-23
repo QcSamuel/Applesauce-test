@@ -25,10 +25,13 @@ jobs:
           rustup target add aarch64-apple-ios
           rustup target add aarch64-apple-ios-sim
 
-      - name: Build Applesauce iOS app
-        env:
-          TOUCHHLE_BOOST_ROOT: "$(brew --prefix boost)/include"
+      - name: Build shared SDL2 for iPhoneOS
         run: |
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build Applesauce iOS app
+        run: |
+          export TOUCHHLE_BOOST_ROOT="$(brew --prefix boost)/include"
           sh platform/ios/scripts/build-host.sh iphoneos Release
 
       - name: Package TrollStore permanent-JIT IPA
