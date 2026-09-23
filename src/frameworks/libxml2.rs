@@ -244,8 +244,14 @@ fn read_guest_cstr_string(env: &Environment, ptr: u32) -> String {
 }
 
 fn cstring_or_default(bytes: &[u8]) -> CString {
-    CString::new(bytes.iter().copied().filter(|&b| b != 0).collect::<Vec<u8>>())
-        .unwrap_or_else(|_| CString::new("").unwrap())
+    CString::new(
+        bytes
+            .iter()
+            .copied()
+            .filter(|&b| b != 0)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap_or_else(|_| CString::new("").unwrap())
 }
 
 /// Read a NUL-terminated string from guest memory and wrap it in a CString.
@@ -346,6 +352,13 @@ fn xmlCtxtReset(_env: &mut Environment, ctxt: u32) {
     if !p.is_null() {
         unsafe { xml::xmlCtxtReset(p) };
     }
+}
+
+#[allow(non_snake_case)]
+fn xmlInitParser(_env: &mut Environment) {
+    // libxml2 documents this as "sets up the library global state"; the real
+    // library is initialized lazily by every entry point we forward to, so
+    // this only needs to exist as a cheap no-op.
 }
 
 #[allow(non_snake_case)]
@@ -661,8 +674,7 @@ fn xmlNewChild(env: &mut Environment, parent: u32, ns: u32, name: u32, content: 
 fn xmlNewTextChild(env: &mut Environment, parent: u32, ns: u32, name: u32, content: u32) -> u32 {
     let n = read_guest_cstring(env, name);
     let c = read_guest_cstring(env, content);
-    let r =
-        unsafe { xml::xmlNewTextChild(h2node(parent), h2ns(ns), cstr_xml(&n), cstr_xml(&c)) };
+    let r = unsafe { xml::xmlNewTextChild(h2node(parent), h2ns(ns), cstr_xml(&n), cstr_xml(&c)) };
     id_for(r as *mut c_void)
 }
 
@@ -765,7 +777,10 @@ fn xmlNodeGetContent(env: &mut Environment, node: u32) -> u32 {
 /// as a real `_xmlNode *`, which fails. This helper serializes that host
 /// libxml node back into XML so the ObjC message hook can build its own small
 /// DOM without exposing host pointers or fake guest libxml structs.
-pub(crate) fn compat_node_handle_to_xml_string(_env: &mut Environment, node: u32) -> Option<String> {
+pub(crate) fn compat_node_handle_to_xml_string(
+    _env: &mut Environment,
+    node: u32,
+) -> Option<String> {
     let n = h2node(node);
     if n.is_null() {
         return None;
@@ -1484,13 +1499,7 @@ fn xmlFreeDtd(_env: &mut Environment, dtd: u32) {
 }
 
 #[allow(non_snake_case)]
-fn xmlNewDtd(
-    env: &mut Environment,
-    doc: u32,
-    name: u32,
-    external_id: u32,
-    system_id: u32,
-) -> u32 {
+fn xmlNewDtd(env: &mut Environment, doc: u32, name: u32, external_id: u32, system_id: u32) -> u32 {
     let n = read_guest_cstring(env, name);
     let e = read_guest_cstring(env, external_id);
     let s = read_guest_cstring(env, system_id);
@@ -2055,9 +2064,7 @@ fn xmlBufferAdd(env: &mut Environment, buf: u32, s: u32, len: i32) -> i32 {
 #[allow(non_snake_case)]
 fn xmlBufferCat(env: &mut Environment, buf: u32, s: u32) -> i32 {
     let bytes = read_guest_cstr(env, s);
-    unsafe {
-        xml::xmlBufferCat(h2buffer(buf), bytes.as_ptr() as *const xml::xmlChar)
-    }
+    unsafe { xml::xmlBufferCat(h2buffer(buf), bytes.as_ptr() as *const xml::xmlChar) }
 }
 
 #[allow(non_snake_case)]
@@ -2069,8 +2076,7 @@ fn xmlNewTextWriterMemory(_env: &mut Environment, buf: u32, compression: i32) ->
 #[allow(non_snake_case)]
 fn xmlNewTextWriterDoc(env: &mut Environment, out_doc: u32, compression: i32) -> u32 {
     let mut host_doc: *mut xml::xmlDoc = ptr::null_mut();
-    let p =
-        unsafe { xml::xmlNewTextWriterDoc(&mut host_doc as *mut _, compression) };
+    let p = unsafe { xml::xmlNewTextWriterDoc(&mut host_doc as *mut _, compression) };
     if out_doc != 0 {
         let id = id_for(host_doc as *mut c_void);
         let pp: MutPtr<u32> = MutPtr::from_bits(out_doc);
@@ -2099,12 +2105,7 @@ fn xmlTextWriterStartDocument(
     let e = read_guest_cstring(env, encoding);
     let s = read_guest_cstring(env, standalone);
     unsafe {
-        xml::xmlTextWriterStartDocument(
-            h2writer(writer),
-            cstr_ptr(&v),
-            cstr_ptr(&e),
-            cstr_ptr(&s),
-        )
+        xml::xmlTextWriterStartDocument(h2writer(writer), cstr_ptr(&v), cstr_ptr(&e), cstr_ptr(&s))
     }
 }
 
@@ -2131,12 +2132,7 @@ fn xmlTextWriterStartElementNS(
     let n = read_guest_cstring(env, name);
     let u = read_guest_cstring(env, ns_uri);
     unsafe {
-        xml::xmlTextWriterStartElementNS(
-            h2writer(writer),
-            cstr_xml(&p),
-            cstr_xml(&n),
-            cstr_xml(&u),
-        )
+        xml::xmlTextWriterStartElementNS(h2writer(writer), cstr_xml(&p), cstr_xml(&n), cstr_xml(&u))
     }
 }
 
@@ -2451,16 +2447,8 @@ fn xmlStrncasecmp(env: &mut Environment, a: u32, b: u32, n: i32) -> i32 {
     let av = read_guest_cstr(env, a);
     let bv = read_guest_cstr(env, b);
     let n = n.max(0) as usize;
-    let a_slice: Vec<u8> = av
-        .iter()
-        .take(n)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    let b_slice: Vec<u8> = bv
-        .iter()
-        .take(n)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let a_slice: Vec<u8> = av.iter().take(n).map(|c| c.to_ascii_lowercase()).collect();
+    let b_slice: Vec<u8> = bv.iter().take(n).map(|c| c.to_ascii_lowercase()).collect();
     match a_slice.cmp(&b_slice) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -2696,6 +2684,14 @@ pub const CONSTANTS: ConstantExports = &[
             p.cast_const()
         }),
     ),
+    // `xmlGenericErrorFunc xmlGenericError` and `void *xmlGenericErrorContext`
+    // — global error handler slots in libxml2 (libxml/xmlerror.h). Apps like
+    // Chrome read/replace them directly to install their own logging. Our
+    // guest-side storage starts NULL; libxml2 inside the wrapper already
+    // routes its diagnostics through the quiet handler, so an app that
+    // installs its own handler simply sees no generic errors reported.
+    ("_xmlGenericError", HostConstant::NullPtr),
+    ("_xmlGenericErrorContext", HostConstant::NullPtr),
 ];
 
 const FUNCTIONS: FunctionExports = &[
@@ -2705,6 +2701,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(xmlFreeParserCtxt(_)),
     export_c_func!(xmlCtxtReset(_)),
     export_c_func!(xmlCleanupParser()),
+    export_c_func!(xmlInitParser()),
     export_c_func!(xmlCtxtGetLastError(_)),
     export_c_func!(xmlCtxtResetLastError(_)),
     export_c_func!(xmlReadFile(_, _, _)),

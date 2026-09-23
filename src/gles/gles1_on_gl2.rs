@@ -21,6 +21,11 @@
 use super::gl21compat_raw as gl21;
 use super::gl21compat_raw::types::*;
 use super::gles11_raw as gles11; // constants only
+
+// GL 2.1 core lacks the OES_read_format names, but the numeric values are
+// identical (0x8B9B / 0x8B98); alias them here for the GET_PARAMS table.
+const IMPLEMENTATION_COLOR_READ_FORMAT_OES: GLenum = 0x8B9B;
+const IMPLEMENTATION_COLOR_READ_TYPE_OES: GLenum = 0x8B98;
 use super::gles_generic::GLES;
 use super::util::{
     fixed_to_float, float_to_fixed, matrix_fixed_to_float, try_decode_pvrtc, PalettedTextureFormat,
@@ -30,6 +35,7 @@ use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
 use std::collections::HashSet;
 use std::ffi::CStr;
+use std::sync::{Mutex, OnceLock};
 
 /// List of capabilities shared by OpenGL ES 1.1 and OpenGL 2.1.
 ///
@@ -155,15 +161,18 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::ALIASED_LINE_WIDTH_RANGE, ParamType::Float, 2),
     (gl21::ALPHA_BITS, ParamType::Int, 1),
     (gl21::ALPHA_TEST, ParamType::Boolean, 1),
-    (gl21::ALPHA_TEST_FUNC, ParamType::Int, 1),
-    // TODO: ALPHA_TEST_REF (has special type conversion behavior)
+    // Type "R" per the GLES 1.1 spec Table 6.1: a plain float clamped to
+    // [0, 1] on set; integer queries round to nearest (the generic Float
+    // arm below implements that rounding).
+    (gl21::ALPHA_TEST_REF, ParamType::Float, 1),
     (gl21::ARRAY_BUFFER_BINDING, ParamType::Int, 1),
     (gl21::BLEND, ParamType::Boolean, 1),
     (gl21::BLEND_DST, ParamType::Int, 1),
     (gl21::BLEND_SRC, ParamType::Int, 1),
     (gl21::BLUE_BITS, ParamType::Int, 1),
     (gl21::CLIENT_ACTIVE_TEXTURE, ParamType::Int, 1),
-    // TODO: arbitrary number of clip planes?
+    // OpenGL (and therefore this passthrough backend) exposes exactly six
+    // clip planes, which is also what the GLES 1.1 spec requires at minimum.
     (gl21::CLIP_PLANE0, ParamType::Boolean, 1),
     (gl21::CLIP_PLANE1, ParamType::Boolean, 1),
     (gl21::CLIP_PLANE2, ParamType::Boolean, 1),
@@ -175,20 +184,29 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::COLOR_ARRAY_SIZE, ParamType::Int, 1),
     (gl21::COLOR_ARRAY_STRIDE, ParamType::Int, 1),
     (gl21::COLOR_ARRAY_TYPE, ParamType::Int, 1),
-    (gl21::COLOR_CLEAR_VALUE, ParamType::FloatSpecial, 4), // TODO correct type
+    (gl21::COLOR_CLEAR_VALUE, ParamType::Color, 4),
     (gl21::COLOR_LOGIC_OP, ParamType::Boolean, 1),
     (gl21::COLOR_MATERIAL, ParamType::Boolean, 1),
     (gl21::COLOR_WRITEMASK, ParamType::Boolean, 4),
-    // TODO: COMPRESSED_TEXTURE_FORMATS (needs to return only supported formats)
+    // The compressed-format list is dynamically sized; the `Int` getter arm
+    // passes the query through to the host driver, which sizes the reply
+    // itself (GL 2.1 supports both queries natively). The returned list is
+    // the host driver's supported set, which is honest: those are exactly
+    // the formats a compressed upload would succeed with.
+    (gl21::NUM_COMPRESSED_TEXTURE_FORMATS, ParamType::Int, 1),
+    (gl21::COMPRESSED_TEXTURE_FORMATS, ParamType::Int, 1),
     (gl21::CULL_FACE, ParamType::Boolean, 1),
     (gl21::CULL_FACE_MODE, ParamType::Int, 1),
-    (gl21::CURRENT_COLOR, ParamType::FloatSpecial, 4), // TODO correct type
-    // TODO: CURRENT_NORMAL (has special type conversion behavior)
+    (gl21::CURRENT_COLOR, ParamType::Color, 4),
+    // Type "R" (unclamped float vector): integer queries round to nearest.
+    (gl21::CURRENT_NORMAL, ParamType::Float, 3),
     (gl21::CURRENT_TEXTURE_COORDS, ParamType::Float, 4),
     (gl21::DEPTH_BITS, ParamType::Int, 1),
-    // TODO: DEPTH_CLEAR_VALUE (has special type conversion behavior)
+    // Type "R": clamped to [0, 1] on set, rounded on integer queries.
+    (gl21::DEPTH_CLEAR_VALUE, ParamType::Float, 1),
     (gl21::DEPTH_FUNC, ParamType::Int, 1),
-    // TODO: DEPTH_RANGE (has special type conversion behavior)
+    // Type "R", two components in [0, 1]; integer queries round.
+    (gl21::DEPTH_RANGE, ParamType::Float, 2),
     (gl21::DEPTH_TEST, ParamType::Boolean, 1),
     (gl21::DEPTH_WRITEMASK, ParamType::Boolean, 1),
     (gl21::DITHER, ParamType::Boolean, 1),
@@ -202,9 +220,12 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::FOG_END, ParamType::Float, 1),
     (gl21::FRONT_FACE, ParamType::Int, 1),
     (gl21::GREEN_BITS, ParamType::Int, 1),
-    // TODO: IMPLEMENTATION_COLOR_READ_FORMAT_OES? (not shared)
-    // TODO: IMPLEMENTATION_COLOR_READ_TYPE_OES? (not shared)
-    // TODO: LIGHT_MODEL_AMBIENT (has special type conversion behavior)
+    // OES_read_format: we can only guarantee what our ReadPixels path
+    // handles natively, which is RGBA/UNSIGNED_BYTE (the commonly-reported
+    // combination on iPhone OS PowerVR drivers as well).
+    (IMPLEMENTATION_COLOR_READ_FORMAT_OES, ParamType::Int, 1),
+    (IMPLEMENTATION_COLOR_READ_TYPE_OES, ParamType::Int, 1),
+    (gl21::LIGHT_MODEL_AMBIENT, ParamType::Color, 4),
     (gl21::LIGHT_MODEL_TWO_SIDE, ParamType::Boolean, 1),
     // TODO: arbitrary number of lights?
     (gl21::LIGHT0, ParamType::Boolean, 1),
@@ -337,7 +358,7 @@ const FOG_PARAMS: ParamTable = ParamTable(&[
     (gl21::FOG_DENSITY, ParamType::Float, 1),
     (gl21::FOG_START, ParamType::Float, 1),
     (gl21::FOG_END, ParamType::Float, 1),
-    (gl21::FOG_COLOR, ParamType::FloatSpecial, 4), // TODO correct type
+    (gl21::FOG_COLOR, ParamType::Color, 4),
 ]);
 
 /// Table of `glLight` parameters shared by OpenGL ES 1.1 and OpenGL 2.1.
@@ -482,6 +503,10 @@ pub struct GLES1OnGL2State {
     pointer_is_fixed_point: [bool; ARRAYS.len()],
     fixed_point_texture_units: HashSet<GLenum>,
     fixed_point_translation_buffers: [Vec<GLfloat>; ARRAYS.len()],
+    /// `GL_ARRAY_BUFFER_BINDING` as it was before `translate_fixed_point_arrays`
+    /// started rebinding buffers, so `restore_fixed_point_arrays` can put it
+    /// back. `None` when no translation is in progress.
+    fixed_point_saved_array_buffer: Option<GLuint>,
     matrix_mode: MatrixModeState,
     matrix_palette_enabled: bool,
     current_palette_matrix: GLuint,
@@ -503,6 +528,7 @@ fn new_gles1_on_gl2_state() -> GLES1OnGL2State {
         pointer_is_fixed_point: [false; ARRAYS.len()],
         fixed_point_texture_units: HashSet::new(),
         fixed_point_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        fixed_point_saved_array_buffer: None,
         matrix_mode: MatrixModeState::ModelView,
         matrix_palette_enabled: false,
         current_palette_matrix: 0,
@@ -628,6 +654,18 @@ impl GLES1OnGL2<'_> {
             let mut buffer_binding = 0;
             gl21::GetIntegerv(array_info.buffer_binding, &mut buffer_binding);
 
+            // Remember the guest's GL_ARRAY_BUFFER binding the first time we
+            // are about to disturb it (the map/unbind below and the rebinds
+            // in restore_fixed_point_arrays), so it can be put back
+            // afterwards. Leaving it changed used to desynchronise the
+            // guest's idea of the binding from the driver's, which turns the
+            // next gl*Pointer offset into a bogus client pointer.
+            if self.state.fixed_point_saved_array_buffer.is_none() {
+                let mut current_array_buffer: GLint = 0;
+                gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut current_array_buffer);
+                self.state.fixed_point_saved_array_buffer = Some(current_array_buffer as GLuint);
+            }
+
             // Get and back up data
 
             let size = array_info.size.map(|size_enum| {
@@ -655,6 +693,11 @@ impl GLES1OnGL2<'_> {
             });
 
             let pointer = if buffer_binding != 0 {
+                // Map the buffer *this* array sources from; it isn't
+                // necessarily the one currently bound to GL_ARRAY_BUFFER
+                // (a previous iteration may have unbound it, or the guest may
+                // have bound a different buffer since specifying the array).
+                gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding as GLuint);
                 let mapped_buffer = gl21::MapBuffer(gl21::ARRAY_BUFFER, gl21::READ_ONLY);
                 assert!(!mapped_buffer.is_null());
                 // in this case the old_pointer is actually an offest!
@@ -737,9 +780,12 @@ impl GLES1OnGL2<'_> {
                 continue;
             };
 
-            if buffer_binding != 0 {
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding);
-            }
+            // The pointer is an offset into `buffer_binding` if that is
+            // non-zero, and a client pointer otherwise — in which case
+            // GL_ARRAY_BUFFER must be unbound, or the driver would treat the
+            // client pointer as an offset into whatever the previous
+            // iteration left bound.
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, buffer_binding);
 
             match array_info.name {
                 gl21::COLOR_ARRAY => {
@@ -773,6 +819,11 @@ impl GLES1OnGL2<'_> {
                 }
                 _ => unreachable!(),
             }
+        }
+        // Put the guest's GL_ARRAY_BUFFER binding back (see
+        // translate_fixed_point_arrays).
+        if let Some(saved) = self.state.fixed_point_saved_array_buffer.take() {
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, saved);
         }
     }
 
@@ -885,10 +936,17 @@ impl GLES1OnGL2<'_> {
         let mut vertex_stride: GLint = 0;
         gl21::GetIntegerv(gl21::VERTEX_ARRAY_STRIDE, &mut vertex_stride);
         let mut vertex_buffer_binding: GLint = 0;
-        gl21::GetIntegerv(gl21::VERTEX_ARRAY_BUFFER_BINDING, &mut vertex_buffer_binding);
+        gl21::GetIntegerv(
+            gl21::VERTEX_ARRAY_BUFFER_BINDING,
+            &mut vertex_buffer_binding,
+        );
         let mut vertex_pointer: *mut GLvoid = std::ptr::null_mut();
         #[allow(clippy::unnecessary_mut_passed)]
         gl21::GetPointerv(gl21::VERTEX_ARRAY_POINTER, &mut vertex_pointer);
+        // Mapping the source buffers below rebinds GL_ARRAY_BUFFER; the
+        // guest's binding must be intact again when we return.
+        let mut old_array_buffer: GLint = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
 
         let vertex_size = vertex_size.clamp(2, 4) as usize;
         let weight = &self.state.palette_weight_state;
@@ -914,8 +972,8 @@ impl GLES1OnGL2<'_> {
             if vertex_mapped {
                 gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
                 gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-                gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
             }
+            gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
             return None;
         }
 
@@ -961,8 +1019,7 @@ impl GLES1OnGL2<'_> {
                 }
                 weight_sum += w;
                 let mat_index = (indices[u] as i64).clamp(0, (palette_count as i64) - 1) as usize;
-                let transformed =
-                    mat4_transform(&self.state.palette_matrices[mat_index], object);
+                let transformed = mat4_transform(&self.state.palette_matrices[mat_index], object);
                 for c in 0..4 {
                     blended[c] += w * transformed[c];
                 }
@@ -981,18 +1038,16 @@ impl GLES1OnGL2<'_> {
         if vertex_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, vertex_buffer_binding as GLuint);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
         if weight_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, weight.buffer_binding);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
         if index_mapped {
             gl21::BindBuffer(gl21::ARRAY_BUFFER, index.buffer_binding);
             gl21::UnmapBuffer(gl21::ARRAY_BUFFER);
-            gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
         }
+        gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
 
         Some(out)
     }
@@ -1010,7 +1065,10 @@ impl GLES1OnGL2<'_> {
             return None;
         }
         let mut index_buffer_binding = 0;
-        gl21::GetIntegerv(gl21::ELEMENT_ARRAY_BUFFER_BINDING, &mut index_buffer_binding);
+        gl21::GetIntegerv(
+            gl21::ELEMENT_ARRAY_BUFFER_BINDING,
+            &mut index_buffer_binding,
+        );
         let base = if index_buffer_binding != 0 {
             let mapped = gl21::MapBuffer(gl21::ELEMENT_ARRAY_BUFFER, gl21::READ_ONLY);
             if mapped.is_null() {
@@ -1078,6 +1136,10 @@ impl GLES1OnGL2<'_> {
         let mut old_pointer: *mut GLvoid = std::ptr::null_mut();
         #[allow(clippy::unnecessary_mut_passed)]
         gl21::GetPointerv(gl21::VERTEX_ARRAY_POINTER, &mut old_pointer);
+        // ... and the guest's GL_ARRAY_BUFFER binding, which is independent
+        // of the vertex array's buffer and must survive this detour too.
+        let mut old_array_buffer: GLint = 0;
+        gl21::GetIntegerv(gl21::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
 
         // Skinned positions are client-side floats: unbind any array buffer.
         gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
@@ -1103,8 +1165,13 @@ impl GLES1OnGL2<'_> {
 
         // Restore the previous vertex array binding/pointer.
         gl21::BindBuffer(gl21::ARRAY_BUFFER, old_buffer as GLuint);
-        gl21::VertexPointer(old_size, old_type as GLenum, old_stride, old_pointer.cast_const());
-        gl21::BindBuffer(gl21::ARRAY_BUFFER, 0);
+        gl21::VertexPointer(
+            old_size,
+            old_type as GLenum,
+            old_stride,
+            old_pointer.cast_const(),
+        );
+        gl21::BindBuffer(gl21::ARRAY_BUFFER, old_array_buffer as GLuint);
     }
 
     unsafe fn draw_arrays_skinned(
@@ -1146,6 +1213,10 @@ fn weight_stride_or(stride: GLint) -> usize {
 }
 
 impl GLES for GLES1OnGL2<'_> {
+    fn is_gles1_on_gl2(&self) -> bool {
+        true
+    }
+
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl21::GetString(gl21::VERSION) as *const _);
         let vendor = CStr::from_ptr(gl21::GetString(gl21::VENDOR) as *const _);
@@ -1166,12 +1237,6 @@ impl GLES for GLES1OnGL2<'_> {
         if ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap) {
             log_dbg!("Tolerating glEnable({:#x}) of client state", cap);
         } else if cap == gles11::MATRIX_PALETTE_OES {
-            // GL_OES_matrix_palette: enable CPU-side palette skinning. Desktop
-            // GL 2.1 has no fixed-function palette skinning and Mesa does not
-            // expose GL_ARB_matrix_palette, so we emulate it ourselves at draw
-            // time (see draw_with_matrix_palette). Track the flag here and do
-            // NOT forward to gl21::Enable (0x8840 is not a valid desktop cap
-            // and would raise GL_INVALID_ENUM).
             self.state.matrix_palette_enabled = true;
             return;
         } else if cap == gl21::PERSPECTIVE_CORRECTION_HINT
@@ -1181,8 +1246,6 @@ impl GLES for GLES1OnGL2<'_> {
             || cap == gl21::TEXTURE
         {
             log_dbg!("Tolerating glEnable({:#x})", cap);
-            // Don't forward shading-model / hint enums to gl21::Enable —
-            // they're not valid capabilities and would set GL_INVALID_ENUM.
             return;
         } else if !CAPABILITIES.contains(&cap) {
             // Per the GLES 1.1 spec, invalid caps set GL_INVALID_ENUM but
@@ -1231,7 +1294,6 @@ impl GLES for GLES1OnGL2<'_> {
     }
     unsafe fn Disable(&mut self, cap: GLenum) {
         if cap == gles11::MATRIX_PALETTE_OES {
-            // See Enable: emulated, never forwarded to the desktop driver.
             self.state.matrix_palette_enabled = false;
             return;
         } else if CAPABILITIES.contains(&cap) {
@@ -1243,10 +1305,18 @@ impl GLES for GLES1OnGL2<'_> {
         } else if GET_PARAMS.contains(cap) || UNSUPPORTED_GET_PARAMS.contains(cap) {
             log_dbg!("Tolerating glDisable({:#x}) of parameter", cap);
         } else {
-            log!(
-                "Warning: Tolerating glDisable({:#x}) of unrecognized capability",
-                cap
-            );
+            static UNKNOWN_DISABLES: OnceLock<Mutex<HashSet<GLenum>>> = OnceLock::new();
+            let first = UNKNOWN_DISABLES
+                .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+                .lock()
+                .map(|mut seen| seen.insert(cap))
+                .unwrap_or(true);
+            if first {
+                log!(
+                    "Warning: Tolerating glDisable({:#x}) of unrecognized capability [first occurrence only]",
+                    cap
+                );
+            }
             return;
         }
         gl21::Disable(cap);
@@ -2125,8 +2195,10 @@ impl GLES for GLES1OnGL2<'_> {
             self.state.pointer_is_fixed_point[2] = true;
             gl21::TexCoordPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
+            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
+            // texture coordinates), so forward it instead of asserting.
+            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
             self.state.fixed_point_texture_units.remove(&active_texture);
             if self.state.fixed_point_texture_units.is_empty() {
                 self.state.pointer_is_fixed_point[2] = false;
@@ -2147,8 +2219,10 @@ impl GLES for GLES1OnGL2<'_> {
             self.state.pointer_is_fixed_point[3] = true;
             gl21::VertexPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
-            assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
+            // GL_BYTE is a valid ES 1.1 pointer type and GL 2.1 accepts it
+            // directly (e.g. Exploration Lite / Kiloblocks passes GL_BYTE
+            // texture coordinates), so forward it instead of asserting.
+            assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
             self.state.pointer_is_fixed_point[3] = false;
             gl21::VertexPointer(size, type_, stride, pointer)
         }
@@ -2239,9 +2313,7 @@ impl GLES for GLES1OnGL2<'_> {
         // GL_OES_matrix_palette skinning for indexed draws: skin the full
         // range of referenced vertices, then draw with blended positions.
         if self.matrix_palette_active() {
-            if let Some((first, vcount)) =
-                self.indexed_draw_vertex_range(count, type_, indices)
-            {
+            if let Some((first, vcount)) = self.indexed_draw_vertex_range(count, type_, indices) {
                 if let Some(skinned) = self.skin_vertices(first, vcount) {
                     self.draw_elements_skinned(mode, count, type_, indices, &skinned);
                     return;
@@ -2458,6 +2530,11 @@ impl GLES for GLES1OnGL2<'_> {
     ) {
         assert!(target == gl21::TEXTURE_2D);
         assert!(level >= 0);
+        let internalformat = if format == gl21::BGRA {
+            gl21::BGRA as GLint
+        } else {
+            internalformat
+        };
         assert!(
             internalformat as GLenum == gl21::ALPHA
                 || internalformat as GLenum == gl21::RGB
@@ -2655,19 +2732,14 @@ impl GLES for GLES1OnGL2<'_> {
         );
         if is_pvrtc_2bit || is_pvrtc_4bit {
             let Ok(width_u) = u32::try_from(width) else {
-                log!(
-                    "Warning: CompressedTexSubImage2D: invalid width {width}; skipping."
-                );
+                log!("Warning: CompressedTexSubImage2D: invalid width {width}; skipping.");
                 return;
             };
             let Ok(height_u) = u32::try_from(height) else {
-                log!(
-                    "Warning: CompressedTexSubImage2D: invalid height {height}; skipping."
-                );
+                log!("Warning: CompressedTexSubImage2D: invalid height {height}; skipping.");
                 return;
             };
-            let pixels =
-                crate::image::decode_pvrtc(data_slice, is_pvrtc_2bit, width_u, height_u);
+            let pixels = crate::image::decode_pvrtc(data_slice, is_pvrtc_2bit, width_u, height_u);
             gl21::TexSubImage2D(
                 target,
                 level,
@@ -3221,13 +3293,7 @@ impl GLES for GLES1OnGL2<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        gl21::RenderbufferStorageMultisampleEXT(
-            target,
-            samples,
-            internalformat,
-            width,
-            height,
-        )
+        gl21::RenderbufferStorageMultisampleEXT(target, samples, internalformat, width, height)
     }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         // Apple's GL_APPLE_framebuffer_multisample doesn't take any arguments:

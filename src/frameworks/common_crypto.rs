@@ -484,89 +484,74 @@ fn aes_decrypt_block(block: &[u8; 16], expanded_key: &[u8], nr: usize) -> [u8; 1
 // to Apple's CCCrypt rather than copying data through unchanged.
 
 const DES_IP: [u8; 64] = [
-    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4,
-    62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40, 32, 24, 16, 8,
-    57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3,
-    61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
+    58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14, 6,
+    64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3, 61,
+    53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7,
 ];
 const DES_FP: [u8; 64] = [
-    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31,
-    38, 6, 46, 14, 54, 22, 62, 30, 37, 5, 45, 13, 53, 21, 61, 29,
-    36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19, 59, 27,
+    40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22, 62, 30,
+    37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19, 59, 27,
     34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25,
 ];
 const DES_E: [u8; 48] = [
-    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13,
-    12, 13, 14, 15, 16, 17, 16, 17, 18, 19, 20, 21, 20, 21, 22, 23, 24, 25,
-    24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
+    32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17, 16, 17, 18,
+    19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1,
 ];
 const DES_P: [u8; 32] = [
-    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10,
-    2, 8, 24, 14, 32, 27, 3, 9, 19, 13, 30, 6, 22, 11, 4, 25,
+    16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27, 3, 9, 19,
+    13, 30, 6, 22, 11, 4, 25,
 ];
 const DES_PC1: [u8; 56] = [
-    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18,
-    10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36,
-    63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22,
-    14, 6, 61, 53, 45, 37, 29, 21, 13, 5, 28, 20, 12, 4,
+    57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60,
+    52, 44, 36, 63, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45, 37, 29,
+    21, 13, 5, 28, 20, 12, 4,
 ];
 const DES_PC2: [u8; 48] = [
-    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10,
-    23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2,
-    41, 52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48,
-    44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32,
+    14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2, 41, 52,
+    31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32,
 ];
-const DES_SHIFTS: [u8; 16] =
-    [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
+const DES_SHIFTS: [u8; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
 
 const DES_SBOX: [[u8; 64]; 8] = [
     [
-        14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7,
-        0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12, 11, 9, 5, 3, 8,
-        4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0,
-        15, 12, 8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13,
+        14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7, 0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12,
+        11, 9, 5, 3, 8, 4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0, 15, 12, 8, 2, 4, 9,
+        1, 7, 5, 11, 3, 14, 10, 0, 6, 13,
     ],
     [
-        15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10,
-        3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1, 10, 6, 9, 11, 5,
-        0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15,
-        13, 8, 10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9,
+        15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10, 3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1,
+        10, 6, 9, 11, 5, 0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15, 13, 8, 10, 1, 3, 15,
+        4, 2, 11, 6, 7, 12, 0, 5, 14, 9,
     ],
     [
-        10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8,
-        13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5, 14, 12, 11, 15, 1,
-        13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7,
-        1, 10, 13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12,
+        10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8, 13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5,
+        14, 12, 11, 15, 1, 13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7, 1, 10, 13, 0, 6,
+        9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12,
     ],
     [
-        7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15,
-        13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2, 12, 1, 10, 14, 9,
-        10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4,
-        3, 15, 0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14,
+        7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15, 13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2,
+        12, 1, 10, 14, 9, 10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4, 3, 15, 0, 6, 10, 1,
+        13, 8, 9, 4, 5, 11, 12, 7, 2, 14,
     ],
     [
-        2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9,
-        14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15, 10, 3, 9, 8, 6,
-        4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14,
-        11, 8, 12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3,
+        2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9, 14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15,
+        10, 3, 9, 8, 6, 4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14, 11, 8, 12, 7, 1, 14,
+        2, 13, 6, 15, 0, 9, 10, 4, 5, 3,
     ],
     [
-        12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11,
-        10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13, 14, 0, 11, 3, 8,
-        9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6,
-        4, 3, 2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13,
+        12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11, 10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13,
+        14, 0, 11, 3, 8, 9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6, 4, 3, 2, 12, 9, 5,
+        15, 10, 11, 14, 1, 7, 6, 0, 8, 13,
     ],
     [
-        4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1,
-        13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5, 12, 2, 15, 8, 6,
-        1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2,
-        6, 11, 13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12,
+        4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1, 13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5,
+        12, 2, 15, 8, 6, 1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2, 6, 11, 13, 8, 1, 4,
+        10, 7, 9, 5, 0, 15, 14, 2, 3, 12,
     ],
     [
-        13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7,
-        1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6, 11, 0, 14, 9, 2,
-        7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8,
-        2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11,
+        13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7, 1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6,
+        11, 0, 14, 9, 2, 7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8, 2, 1, 14, 7, 4, 10,
+        8, 13, 15, 12, 9, 0, 3, 5, 6, 11,
     ],
 ];
 
@@ -959,13 +944,19 @@ fn CCCrypt(
         }
         let input = env.mem.bytes_at(data_in.cast(), data_in_length).to_vec();
         let iv_bytes_opt = if !ecb_mode && !iv.is_null() {
-            Some(env.mem.bytes_at(iv.cast(), block_size as GuestUSize).to_vec())
+            Some(
+                env.mem
+                    .bytes_at(iv.cast(), block_size as GuestUSize)
+                    .to_vec(),
+            )
         } else {
             None
         };
         let iv_slice = iv_bytes_opt.as_deref();
         let is_encrypt = op == 0;
-        return match des_process(is_encrypt, &input, &key_bytes, iv_slice, pkcs7_pad, ecb_mode) {
+        return match des_process(
+            is_encrypt, &input, &key_bytes, iv_slice, pkcs7_pad, ecb_mode,
+        ) {
             Ok(output) => {
                 if data_out_available < output.len() as GuestUSize {
                     return kCCBufferTooSmall;
@@ -991,19 +982,169 @@ fn CCCrypt(
     kCCSuccess
 }
 
+// CCPBKDFAlgorithm
+const kCCPBKDF2: u32 = 2;
+
+// CCPseudoRandomAlgorithm
+const kCCPRFHmacAlgSHA1: u32 = 1;
+const kCCPRFHmacAlgSHA224: u32 = 2;
+const kCCPRFHmacAlgSHA256: u32 = 3;
+const kCCPRFHmacAlgSHA384: u32 = 4;
+const kCCPRFHmacAlgSHA512: u32 = 5;
+
+/// HMAC over the whole message, generic over the digest (RFC 2104).
+fn hmac_generic<D>(key: &[u8], message: &[u8]) -> Vec<u8>
+where
+    D: Sha2Digest + digest::core_api::BlockSizeUser,
+{
+    use digest::typenum::Unsigned;
+    let block_size = <<D as digest::core_api::BlockSizeUser>::BlockSize as Unsigned>::USIZE;
+    let mut key_block = vec![0u8; block_size];
+    if key.len() > block_size {
+        let hashed = D::digest(key);
+        key_block[..hashed.len()].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = D::new();
+    inner.update(key_block.iter().map(|b| b ^ 0x36).collect::<Vec<u8>>());
+    inner.update(message);
+    let inner_hash = inner.finalize();
+    let mut outer = D::new();
+    outer.update(key_block.iter().map(|b| b ^ 0x5c).collect::<Vec<u8>>());
+    outer.update(inner_hash);
+    outer.finalize().to_vec()
+}
+
+/// PBKDF2 (RFC 8018 §5.2) with an arbitrary HMAC pseudo-random function.
+fn pbkdf2(
+    prf: fn(&[u8], &[u8]) -> Vec<u8>,
+    password: &[u8],
+    salt: &[u8],
+    rounds: u32,
+    derived_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(derived_len);
+    let mut block_index: u32 = 1;
+    while out.len() < derived_len {
+        let mut salt_block = salt.to_vec();
+        salt_block.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = prf(password, &salt_block);
+        let mut t = u.clone();
+        for _ in 1..rounds {
+            u = prf(password, &u);
+            for (t_byte, u_byte) in t.iter_mut().zip(u.iter()) {
+                *t_byte ^= u_byte;
+            }
+        }
+        let remaining = derived_len - out.len();
+        out.extend_from_slice(&t[..remaining.min(t.len())]);
+        block_index = block_index.wrapping_add(1);
+    }
+    out
+}
+
+/// `int CCKeyDerivationPBKDF(CCPBKDFAlgorithm algorithm, const char *password,
+/// size_t passwordLen, const uint8_t *salt, size_t saltLen,
+/// CCPseudoRandomAlgorithm prf, uint rounds, uint8_t *derivedKey,
+/// size_t derivedKeyLen)`
 #[allow(non_snake_case)]
 fn CCKeyDerivationPBKDF(
-    _env: &mut Environment,
-    _algorithm: u32,
-    _password: ConstVoidPtr,
-    _password_len: GuestUSize,
-    _salt: ConstVoidPtr,
-    _salt_len: GuestUSize,
-    _prf: u32,
-    _rounds: u32,
+    env: &mut Environment,
+    algorithm: u32,
+    password: ConstVoidPtr,
+    password_len: GuestUSize,
+    salt: ConstVoidPtr,
+    salt_len: GuestUSize,
+    prf: u32,
+    rounds: u32,
+    derived_key: MutVoidPtr,
+    derived_key_len: GuestUSize,
 ) -> i32 {
-    log!("TODO: CCKeyDerivationPBKDF");
+    if algorithm != kCCPBKDF2 {
+        log!("CCKeyDerivationPBKDF: unsupported algorithm {}", algorithm);
+        return kCCParamError;
+    }
+    if derived_key.is_null() || derived_key_len == 0 || rounds == 0 {
+        return kCCParamError;
+    }
+    let prf_fn: fn(&[u8], &[u8]) -> Vec<u8> = match prf {
+        kCCPRFHmacAlgSHA1 => hmac_generic::<Sha1>,
+        kCCPRFHmacAlgSHA224 => hmac_generic::<Sha224>,
+        kCCPRFHmacAlgSHA256 => hmac_generic::<Sha256>,
+        kCCPRFHmacAlgSHA384 => hmac_generic::<Sha384>,
+        kCCPRFHmacAlgSHA512 => hmac_generic::<Sha512>,
+        _ => {
+            log!("CCKeyDerivationPBKDF: unsupported PRF {}", prf);
+            return kCCParamError;
+        }
+    };
+
+    let password_bytes = read_guest_bytes(env, password, password_len);
+    let salt_bytes = read_guest_bytes(env, salt, salt_len);
+
+    log_dbg!(
+        "CCKeyDerivationPBKDF(prf={}, passwordLen={}, saltLen={}, rounds={}, derivedKeyLen={})",
+        prf,
+        password_len,
+        salt_len,
+        rounds,
+        derived_key_len
+    );
+
+    let derived = pbkdf2(
+        prf_fn,
+        &password_bytes,
+        &salt_bytes,
+        rounds,
+        derived_key_len as usize,
+    );
+    write_digest(env, derived_key, &derived);
     kCCSuccess
+}
+
+#[cfg(test)]
+mod pbkdf2_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    // Test vectors from RFC 6070 (PBKDF2-HMAC-SHA1).
+    #[test]
+    fn rfc6070_sha1() {
+        let prf: fn(&[u8], &[u8]) -> Vec<u8> = hmac_generic::<Sha1>;
+        assert_eq!(
+            hex(&pbkdf2(prf, b"password", b"salt", 1, 20)),
+            "0c60c80f961f0e71f3a9b524af6012062fe037a6"
+        );
+        assert_eq!(
+            hex(&pbkdf2(prf, b"password", b"salt", 4096, 20)),
+            "4b007901b765489abead49d926f721d065a429c1"
+        );
+        assert_eq!(
+            hex(&pbkdf2(
+                prf,
+                b"passwordPASSWORDpassword",
+                b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                4096,
+                25
+            )),
+            "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038"
+        );
+    }
+
+    // Test vector from RFC 7914 §11 (PBKDF2-HMAC-SHA256).
+    #[test]
+    fn rfc7914_sha256() {
+        let prf: fn(&[u8], &[u8]) -> Vec<u8> = hmac_generic::<Sha256>;
+        assert_eq!(
+            hex(&pbkdf2(prf, b"passwd", b"salt", 1, 64)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+             49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+        );
+    }
 }
 
 // One-shot MD5 hash (host-side, no guest memory)
@@ -1381,7 +1522,12 @@ fn write_digest(env: &mut Environment, md: MutVoidPtr, digest: &[u8]) {
 }
 
 #[allow(non_snake_case)]
-fn CC_SHA1(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVoidPtr) -> MutVoidPtr {
+fn CC_SHA1(
+    env: &mut Environment,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+    md: MutVoidPtr,
+) -> MutVoidPtr {
     use sha1::{Digest, Sha1};
     if md.is_null() {
         return MutVoidPtr::null();
@@ -1393,7 +1539,12 @@ fn CC_SHA1(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVo
 }
 
 #[allow(non_snake_case)]
-fn CC_SHA224(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVoidPtr) -> MutVoidPtr {
+fn CC_SHA224(
+    env: &mut Environment,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+    md: MutVoidPtr,
+) -> MutVoidPtr {
     use sha2::{Digest, Sha224};
     if md.is_null() {
         return MutVoidPtr::null();
@@ -1405,7 +1556,12 @@ fn CC_SHA224(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: Mut
 }
 
 #[allow(non_snake_case)]
-fn CC_SHA256(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVoidPtr) -> MutVoidPtr {
+fn CC_SHA256(
+    env: &mut Environment,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+    md: MutVoidPtr,
+) -> MutVoidPtr {
     use sha2::{Digest, Sha256};
     if md.is_null() {
         return MutVoidPtr::null();
@@ -1417,7 +1573,12 @@ fn CC_SHA256(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: Mut
 }
 
 #[allow(non_snake_case)]
-fn CC_SHA384(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVoidPtr) -> MutVoidPtr {
+fn CC_SHA384(
+    env: &mut Environment,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+    md: MutVoidPtr,
+) -> MutVoidPtr {
     use sha2::{Digest, Sha384};
     if md.is_null() {
         return MutVoidPtr::null();
@@ -1429,7 +1590,12 @@ fn CC_SHA384(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: Mut
 }
 
 #[allow(non_snake_case)]
-fn CC_SHA512(env: &mut Environment, data: ConstVoidPtr, len: GuestUSize, md: MutVoidPtr) -> MutVoidPtr {
+fn CC_SHA512(
+    env: &mut Environment,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+    md: MutVoidPtr,
+) -> MutVoidPtr {
     use sha2::{Digest, Sha512};
     if md.is_null() {
         return MutVoidPtr::null();
@@ -1504,16 +1670,17 @@ fn sha_init(env: &mut Environment, c: MutVoidPtr, state: ShaState) -> i32 {
     if c.is_null() {
         return 0;
     }
-    env.mem
-        .write(c.cast::<u32>(), SHA_INIT_SENTINEL.to_le());
-    sha_state_table()
-        .lock()
-        .unwrap()
-        .insert(c.to_bits(), state);
+    env.mem.write(c.cast::<u32>(), SHA_INIT_SENTINEL.to_le());
+    sha_state_table().lock().unwrap().insert(c.to_bits(), state);
     1
 }
 
-fn sha_update_inner(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn sha_update_inner(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     if c.is_null() {
         return 0;
     }
@@ -1562,7 +1729,12 @@ fn CC_SHA1_Init(env: &mut Environment, c: MutVoidPtr) -> i32 {
     sha_init(env, c, ShaState::S1(Sha1::new()))
 }
 #[allow(non_snake_case)]
-fn CC_SHA1_Update(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn CC_SHA1_Update(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     sha_update_inner(env, c, data, len)
 }
 #[allow(non_snake_case)]
@@ -1575,7 +1747,12 @@ fn CC_SHA224_Init(env: &mut Environment, c: MutVoidPtr) -> i32 {
     sha_init(env, c, ShaState::S224(Sha224::new()))
 }
 #[allow(non_snake_case)]
-fn CC_SHA224_Update(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn CC_SHA224_Update(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     sha_update_inner(env, c, data, len)
 }
 #[allow(non_snake_case)]
@@ -1588,7 +1765,12 @@ fn CC_SHA256_Init(env: &mut Environment, c: MutVoidPtr) -> i32 {
     sha_init(env, c, ShaState::S256(Sha256::new()))
 }
 #[allow(non_snake_case)]
-fn CC_SHA256_Update(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn CC_SHA256_Update(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     sha_update_inner(env, c, data, len)
 }
 #[allow(non_snake_case)]
@@ -1601,7 +1783,12 @@ fn CC_SHA384_Init(env: &mut Environment, c: MutVoidPtr) -> i32 {
     sha_init(env, c, ShaState::S384(Sha384::new()))
 }
 #[allow(non_snake_case)]
-fn CC_SHA384_Update(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn CC_SHA384_Update(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     sha_update_inner(env, c, data, len)
 }
 #[allow(non_snake_case)]
@@ -1614,7 +1801,12 @@ fn CC_SHA512_Init(env: &mut Environment, c: MutVoidPtr) -> i32 {
     sha_init(env, c, ShaState::S512(Sha512::new()))
 }
 #[allow(non_snake_case)]
-fn CC_SHA512_Update(env: &mut Environment, c: MutVoidPtr, data: ConstVoidPtr, len: GuestUSize) -> i32 {
+fn CC_SHA512_Update(
+    env: &mut Environment,
+    c: MutVoidPtr,
+    data: ConstVoidPtr,
+    len: GuestUSize,
+) -> i32 {
     sha_update_inner(env, c, data, len)
 }
 #[allow(non_snake_case)]
@@ -1820,7 +2012,10 @@ fn CCCryptorCreate(
 
     // Hand out a small guest allocation as the opaque handle.
     let handle: MutVoidPtr = env.mem.alloc(4);
-    cryptor_table().lock().unwrap().insert(handle.to_bits(), state);
+    cryptor_table()
+        .lock()
+        .unwrap()
+        .insert(handle.to_bits(), state);
     env.mem.write(cryptor_ref_out, handle);
     kCCSuccess
 }
@@ -1868,7 +2063,11 @@ fn CCCryptorUpdate(
         let bs = state.block_size;
         state.buffer.extend_from_slice(&input);
 
-        let hold_back = if !state.encrypt && state.pkcs7_pad { bs } else { 0 };
+        let hold_back = if !state.encrypt && state.pkcs7_pad {
+            bs
+        } else {
+            0
+        };
         let available = state.buffer.len();
         let process_len = if available > hold_back {
             ((available - hold_back) / bs) * bs
@@ -2062,7 +2261,10 @@ fn CCCryptorRelease(env: &mut Environment, cryptor_ref: MutVoidPtr) -> i32 {
     if cryptor_ref.is_null() {
         return kCCSuccess;
     }
-    cryptor_table().lock().unwrap().remove(&cryptor_ref.to_bits());
+    cryptor_table()
+        .lock()
+        .unwrap()
+        .remove(&cryptor_ref.to_bits());
     env.mem.free(cryptor_ref);
     kCCSuccess
 }
@@ -2075,7 +2277,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CCCryptorGetOutputLength(_, _, _)),
     export_c_func!(CCCryptorReset(_, _)),
     export_c_func!(CCCryptorRelease(_)),
-    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _)),
+    export_c_func!(CCKeyDerivationPBKDF(_, _, _, _, _, _, _, _, _)),
     export_c_func!(CCHmac(_, _, _, _, _, _)),
     export_c_func!(CC_MD5_Init(_)),         // Было (_, _), нужно (_)
     export_c_func!(CC_MD5_Update(_, _, _)), // Было (_, _, _, _), нужно (_, _, _)
@@ -2087,7 +2289,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CC_SHA256(_, _, _)),
     export_c_func!(CC_SHA384(_, _, _)),
     export_c_func!(CC_SHA512(_, _, _)),
-                                            // SecItem* helpers are exported from frameworks::security; not duplicated.
+    // SecItem* helpers are exported from frameworks::security; not duplicated.
     export_c_func!(CC_SHA1_Init(_)),
     export_c_func!(CC_SHA1_Update(_, _, _)),
     export_c_func!(CC_SHA1_Final(_, _)),

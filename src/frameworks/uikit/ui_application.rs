@@ -38,8 +38,17 @@ struct UIApplicationHostObject {
     /// defaults to 0; we honour both the getter and the setter even
     /// though touchHLE has no springboard to actually render the badge.
     application_icon_badge_number: NSInteger,
+    remote_notifications_registered: bool,
+    user_notification_settings: id,
 }
 impl HostObject for UIApplicationHostObject {}
+
+#[derive(Default)]
+struct UIUserNotificationSettingsHostObject {
+    types: NSUInteger,
+    categories: id,
+}
+impl HostObject for UIUserNotificationSettingsHostObject {}
 
 pub type UIInterfaceOrientation = UIDeviceOrientation;
 #[allow(unused)]
@@ -73,6 +82,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         delegate_is_retained: false,
         status_bar_style: 0,
         application_icon_badge_number: 0,
+        remote_notifications_registered: false,
+        user_notification_settings: nil,
     });
     env.objc.alloc_static_object(this, host_object, &mut env.mem)
 }
@@ -304,13 +315,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)openURL:(id)url { // NSURL
     let ns_string = msg![env; url absoluteString];
     let url_string = ns_string::to_rust_string(env, ns_string);
+    // Hand the URL to the host (on Android this opens the system browser
+    // via MainActivity.openExternalUrl and the emulator keeps running —
+    // exiting the process here killed the app before the intent could
+    // dispatch, so links never opened).
     if let Err(e) = crate::window::open_url(env, &url_string) {
-        echo!("App opened URL {:?} unsuccessfully ({}), exiting.", url_string, e);
+        echo!("App opened URL {:?} unsuccessfully ({}).", url_string, e);
     } else {
-        echo!("App opened URL {:?}, exiting.", url_string);
+        echo!("App opened URL {:?}.", url_string);
     }
-
-    exit(env);
     true
 }
 
@@ -399,23 +412,81 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())registerForRemoteNotifications {
-    log!("UIApplication registerForRemoteNotifications: stubbed");
+    let delegate = msg![env; this delegate];
+    env.objc
+        .borrow_mut::<UIApplicationHostObject>(this)
+        .remote_notifications_registered = true;
+
+    if delegate != nil
+        && env.objc.object_has_method_named(
+            &env.mem,
+            delegate,
+            "application:didRegisterForRemoteNotificationsWithDeviceToken:",
+        )
+    {
+        let token_bytes = [
+            0x48, 0x79, 0x70, 0x65, 0x72, 0x48, 0x4c, 0x45,
+            0x00, 0x00, 0x00, 0x01, 0x52, 0x45, 0x47, 0x49,
+        ];
+        let token_length: u32 = token_bytes.len().try_into().unwrap();
+        let token_buffer = env.mem.alloc(token_length);
+        env.mem
+            .bytes_at_mut(token_buffer.cast(), token_length)
+            .copy_from_slice(&token_bytes);
+        let token_ptr = token_buffer.cast_const().cast_void();
+        let token_data: id = msg_class![env; NSData dataWithBytes:token_ptr length:token_length];
+        env.mem.free(token_buffer.cast());
+        let _: () = msg![env;
+            delegate application:this didRegisterForRemoteNotificationsWithDeviceToken:token_data
+        ];
+    }
 }
 
 - (())unregisterForRemoteNotifications {
-    log!("UIApplication unregisterForRemoteNotifications: stubbed");
+    env.objc
+        .borrow_mut::<UIApplicationHostObject>(this)
+        .remote_notifications_registered = false;
 }
 
 - (bool)isRegisteredForRemoteNotifications {
-    false
+    env.objc
+        .borrow::<UIApplicationHostObject>(this)
+        .remote_notifications_registered
 }
 
-- (())registerUserNotificationSettings:(id)_settings {
-    log!("UIApplication registerUserNotificationSettings: stubbed");
+- (())registerUserNotificationSettings:(id)settings {
+    let old_settings = {
+        let host = env.objc.borrow_mut::<UIApplicationHostObject>(this);
+        let old = host.user_notification_settings;
+        host.user_notification_settings = settings;
+        old
+    };
+    retain(env, settings);
+    release(env, old_settings);
+
+    let delegate = msg![env; this delegate];
+    if delegate != nil
+        && env.objc.object_has_method_named(
+            &env.mem,
+            delegate,
+            "application:didRegisterUserNotificationSettings:",
+        )
+    {
+        let _: () = msg![env; delegate application:this didRegisterUserNotificationSettings:settings];
+    }
 }
 
 - (id)currentUserNotificationSettings {
-    nil
+    let settings = env
+        .objc
+        .borrow::<UIApplicationHostObject>(this)
+        .user_notification_settings;
+    if settings == nil {
+        nil
+    } else {
+        retain(env, settings);
+        autorelease(env, settings)
+    }
 }
 
 - (())cancelAllLocalNotifications {
@@ -504,7 +575,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())registerForRemoteNotificationTypes:(UIRemoteNotificationType)types {
-    log!("TODO: ignoring registerForRemoteNotificationTypes:{}", types);
+    // Push notifications cannot work in an emulator; apps register on every
+    // launch, so keep the log quiet (debug level only).
+    log_dbg!("registerForRemoteNotificationTypes:{} ignored", types);
 }
 
 // `- (UIRemoteNotificationType)enabledRemoteNotificationTypes` —
@@ -552,15 +625,56 @@ pub const CLASSES: ClassExports = objc_classes! {
 // we expose a minimal stub that satisfies alloc/init and settingsForTypes:categories:.
 @implementation UIUserNotificationSettings: NSObject
 
-+ (id)settingsForTypes:(NSUInteger)_types categories:(id)_categories {
-    // Return a shared dummy instance. Apps only inspect -types on the object
-    // returned by -[UIApplication currentUserNotificationSettings], which
-    // returns nil, so this object does not need to store anything.
-    msg_class![env; UIUserNotificationSettings new]
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(
+        this,
+        Box::new(UIUserNotificationSettingsHostObject {
+            types: 0,
+            categories: nil,
+        }),
+        &mut env.mem,
+    )
+}
+
++ (id)settingsForTypes:(NSUInteger)types categories:(id)categories {
+    let settings: id = msg![env; this alloc];
+    let host = env.objc.borrow_mut::<UIUserNotificationSettingsHostObject>(settings);
+    host.types = types;
+    host.categories = categories;
+    retain(env, categories);
+    autorelease(env, settings)
+}
+
+- (id)init {
+    this
+}
+
+- (())dealloc {
+    let categories = env
+        .objc
+        .borrow::<UIUserNotificationSettingsHostObject>(this)
+        .categories;
+    release(env, categories);
+    env.objc.dealloc_object(this, &mut env.mem)
 }
 
 - (NSUInteger)types {
-    0 // UIUserNotificationTypeNone
+    env.objc
+        .borrow::<UIUserNotificationSettingsHostObject>(this)
+        .types
+}
+
+- (id)categories {
+    let categories = env
+        .objc
+        .borrow::<UIUserNotificationSettingsHostObject>(this)
+        .categories;
+    if categories == nil {
+        nil
+    } else {
+        retain(env, categories);
+        autorelease(env, categories)
+    }
 }
 
 @end
@@ -814,6 +928,101 @@ pub(super) fn UIApplicationMain(
     let _: () = msg![env; run_loop run];
 }
 
+/// Dispatches `applicationWillResignActive:` and posts
+/// `UIApplicationWillResignActiveNotification`. Called when the OS tells
+/// touchHLE the app is about to stop being active (Android `onPause()`,
+/// iOS `applicationWillResignActive:`). Unlike [exit], this does NOT
+/// terminate the process — the app may return to the foreground later.
+///
+/// Apple docs: <https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillresignactive(_:)>
+pub(super) fn handle_will_resign_active(env: &mut Environment) {
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationWillResignActive:")
+    {
+        () = msg![env; delegate applicationWillResignActive:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationWillResignActiveNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// Dispatches `applicationDidEnterBackground:` and posts
+/// `UIApplicationDidEnterBackgroundNotification`.
+///
+/// Apple docs: <https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidenterbackground(_:)>
+pub(super) fn handle_did_enter_background(env: &mut Environment) {
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    // Real iOS apps are often killed by the OS shortly after entering the
+    // background, so persist user defaults eagerly: it's the last reliable
+    // moment to flush any data.
+    if !env.is_app_picker {
+        let user_defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+        let _: bool = msg![env; user_defaults synchronize];
+    }
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationDidEnterBackground:")
+    {
+        () = msg![env; delegate applicationDidEnterBackground:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationDidEnterBackgroundNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// Dispatches `applicationWillEnterForeground:` and posts
+/// `UIApplicationWillEnterForegroundNotification`.
+///
+/// Apple docs: <https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillenterforeground(_:)>
+pub(super) fn handle_will_enter_foreground(env: &mut Environment) {
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationWillEnterForeground:")
+    {
+        () = msg![env; delegate applicationWillEnterForeground:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationWillEnterForegroundNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
+/// Dispatches `applicationDidBecomeActive:` and posts
+/// `UIApplicationDidBecomeActiveNotification`. Used both at launch time and
+/// when the app returns to the foreground after being inactive/backgrounded.
+///
+/// Apple docs: <https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidbecomeactive(_:)>
+pub(super) fn handle_did_become_active(env: &mut Environment) {
+    let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+
+    let pool: id = msg_class![env; NSAutoreleasePool new];
+    let delegate: id = msg![env; ui_application delegate];
+    if env
+        .objc
+        .object_has_method_named(&env.mem, delegate, "applicationDidBecomeActive:")
+    {
+        () = msg![env; delegate applicationDidBecomeActive:ui_application];
+    }
+    let notif_name = get_static_str(env, UIApplicationDidBecomeActiveNotification);
+    () = msg![env; center postNotificationName:notif_name object:ui_application userInfo:nil];
+    let _: () = msg![env; pool drain];
+}
+
 pub(super) fn exit(env: &mut Environment) {
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -896,8 +1105,7 @@ const UIApplicationStatusBarOrientationUserInfoKey: &str =
     "UIApplicationStatusBarOrientationUserInfoKey";
 const UIApplicationBackgroundFetchIntervalMinimum: &str =
     "UIApplicationBackgroundFetchIntervalMinimum";
-const UIApplicationBackgroundFetchIntervalNever: &str =
-    "UIApplicationBackgroundFetchIntervalNever";
+const UIApplicationBackgroundFetchIntervalNever: &str = "UIApplicationBackgroundFetchIntervalNever";
 // Launch options keys — Apple `UIApplication.h` (`UIApplicationLaunchOptionsKey`).
 const UIApplicationLaunchOptionsURLKey: &str = "UIApplicationLaunchOptionsURLKey";
 const UIApplicationLaunchOptionsSourceApplicationKey: &str =

@@ -26,28 +26,37 @@
 
 #[macro_use]
 mod log;
+mod env_flags;
+mod fastmap;
 mod abi;
+mod android_media;
+mod android_web_view;
 mod audio;
 mod bundle;
+mod corrupt;
 mod cpu;
+mod crash_handler;
 mod debug;
 mod dyld;
 mod environment;
-mod font;
+pub mod font;
 mod frameworks;
 mod fs;
 mod gdb;
 mod gles;
 mod image;
 mod libc;
-mod licenses;
 mod mach_o;
 mod matrix;
 mod mem;
 mod objc;
 mod options;
 mod paths;
+mod perf_hints;
 mod stack;
+mod guest_clock;
+mod trainer;
+mod trainer_ui;
 mod window;
 
 // Environment is used very frequently used and used to be in this module, so
@@ -60,6 +69,15 @@ use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAU
 use std::path::PathBuf;
 #[cfg(target_os = "ios")]
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+// PERF: use mimalloc as the global allocator. The emulator performs a large
+// number of small, short-lived allocations per frame (autorelease pools,
+// string handling and various collections in the Foundation/UIKit HLE
+// implementations), a workload that mimalloc handles measurably faster than
+// the platform malloc — in particular on Android, where every allocation
+// additionally goes through Scudo hardening.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub use touchHLE_version::*;
 
@@ -203,15 +221,34 @@ Special options:
     --help
         Display this help text.
 
-    --copyright
-        Display copyright, authorship and license information.
-
     --info
         Print basic information about the app bundle without running the app.
 ";
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
+    crash_handler::install();
+    crash_handler::install_panic_hook();
+
+    #[cfg(target_os = "android")]
+    {
+        // PERF: raise the scheduling priority of the thread that runs the
+        // emulation loop. Android aggressively deprioritises background-ish
+        // app threads, which on big.LITTLE SoCs tends to keep the emulator on
+        // a little (efficiency) core and costs a large chunk of FPS. SDL's
+        // implementation of SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH)
+        // on Android/Linux raises the niceness of the calling thread and
+        // degrades gracefully (returns -1) if the OS disallows it — this is
+        // deliberately routed through SDL rather than libc::setpriority
+        // because the latter is not exposed for Android by the libc crate.
+        let rc = unsafe {
+            sdl2_sys::SDL_SetThreadPriority(sdl2_sys::SDL_ThreadPriority::SDL_THREAD_PRIORITY_HIGH)
+        };
+        if rc != 0 {
+            log!("Warning: failed to raise emulator thread priority; continuing with default priority.");
+        }
+    }
+
     echo!(
-        "touchHLE {}{}{} — https://touchhle.org/",
+        "touchHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
@@ -249,9 +286,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         } else if arg == "--help" {
             echo!("{}", USAGE);
             echo!("{}", options::OPTIONS_HELP);
-            return Ok(());
-        } else if arg == "--copyright" {
-            echo!("{}", licenses::get_text());
             return Ok(());
         } else if arg == "--info" {
             just_info = true;
@@ -534,6 +568,19 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
             std::panic::resume_unwind(e)
         }
     };
-    env.run();
-    Ok(())
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.run()));
+    match run_result {
+        Ok(()) => Ok(()),
+        Err(payload) => {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "guest application terminated unexpectedly".to_string()
+            };
+            echo!("Guest application stopped: {}", message);
+            Err(message)
+        }
+    }
 }

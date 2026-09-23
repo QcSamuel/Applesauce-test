@@ -193,8 +193,32 @@ pub fn url_for_opening_user_data_dir() -> Result<String, String> {
         let path = path
             .to_str()
             .ok_or_else(|| "User data directory path is not UTF-8".to_string())?;
-        // std::fs::canonicalize() on Windows uses the extended-length path
-        // syntax, but Windows Explorer doesn't understand it.
+        let path = if std::env::consts::OS == "windows" {
+            path.strip_prefix("\\\\?\\").unwrap_or(path)
+        } else {
+            path
+        };
+        Ok(format!("file://{path}"))
+    }
+}
+
+pub fn url_for_opening_apps_dir() -> Result<String, String> {
+    let apps_dir = user_data_base_path().join(APPS_DIR);
+    if std::env::consts::OS == "android" {
+        let brand = crate::branding();
+        Ok(format!(
+            "content://org.touchhle.android{}{}.provider/root/root/{}",
+            if brand.is_empty() { "" } else { "." },
+            brand.to_lowercase(),
+            APPS_DIR
+        ))
+    } else {
+        let path = apps_dir
+            .canonicalize()
+            .map_err(|e| format!("Can't canonicalize apps directory: {e}"))?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| "Apps directory path is not UTF-8".to_string())?;
         let path = if std::env::consts::OS == "windows" {
             path.strip_prefix("\\\\?\\").unwrap_or(path)
         } else {
@@ -214,6 +238,25 @@ pub fn prepopulate_user_data_dir() {
     let base_path = user_data_base_path();
     if base_path == Path::new(".") {
         return;
+    }
+
+    let has_user_wallpaper = WALLPAPER_FILES
+        .iter()
+        .any(|name| base_path.join(name).is_file());
+    if !has_user_wallpaper {
+        match ResourceFile::open(WALLPAPER_FILES[0]) {
+            Ok(mut resource) => {
+                let mut image = Vec::new();
+                match resource.get().read_to_end(&mut image) {
+                    Ok(_) => match std::fs::write(base_path.join(WALLPAPER_FILES[0]), image) {
+                        Ok(()) => log!("Created default wallpaper"),
+                        Err(e) => log!("Warning: Couldn't create default wallpaper: {}", e),
+                    },
+                    Err(e) => log!("Warning: Couldn't read default wallpaper: {}", e),
+                }
+            }
+            Err(e) => log!("Warning: Couldn't open default wallpaper: {}", e),
+        }
     }
 
     let apps_dir = base_path.join(APPS_DIR);

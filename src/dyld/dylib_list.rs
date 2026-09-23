@@ -10,6 +10,15 @@ use crate::libc;
 use crate::objc;
 
 // CoreAudio
+// libresolv.9 (stub resolver state functions)
+pub const LIBRESOLV: super::HostDylib = super::HostDylib {
+    path: "/usr/lib/libresolv.9.dylib",
+    aliases: &["/usr/lib/libresolv.dylib"],
+    class_exports: &[],
+    constant_exports: &[],
+    function_exports: &[],
+};
+
 pub const CORE_AUDIO: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
     aliases: &[],
@@ -97,6 +106,11 @@ pub const TWITTER: super::HostDylib = super::HostDylib {
     function_exports: &[],
 };
 
+// libresolv — stub resolver-state entry points live in the main libc table
+// (src/libc.rs), which every app links against; listing them here too would
+// trip the no-duplicate-exports test. The dylib entry stays so the path
+// resolves and non-lazy relocations don't warn about a missing dylib.
+// CoreTelephony — touchHLE has no cellular radio, but we expose real
 // CoreTelephony — touchHLE has no cellular radio, but we expose real
 // `CTTelephonyNetworkInfo` / `CTCarrier` classes plus the
 // `CTRadioAccessTechnology*` string constants and the
@@ -151,7 +165,7 @@ pub const AD_SUPPORT: super::HostDylib = super::HostDylib {
 pub const CORE_IMAGE: super::HostDylib = super::HostDylib {
     path: "/System/Library/Frameworks/CoreImage.framework/CoreImage",
     aliases: &[],
-    class_exports: &[frameworks::core_image::CLASSES],
+    class_exports: &[frameworks::core_image::CLASSES, frameworks::core_image::pipeline::CLASSES],
     constant_exports: &[frameworks::core_image::CONSTANTS],
     function_exports: &[frameworks::core_image::FUNCTIONS],
 };
@@ -192,6 +206,8 @@ pub const ACCELERATE: super::HostDylib = super::HostDylib {
 /// The single list of host dylibs that the linker (and Objective-C runtime)
 /// searches through.
 pub const DYLIB_LIST: &[&super::HostDylib] = &[
+    &frameworks::mopub::DYLIB,
+    &frameworks::javascript_core::DYLIB,
     &libc::DYLIB,
     &objc::DYLIB,
     &crate::environment::app_picker::DYLIB, // Not a real library; special internal classes.
@@ -210,6 +226,9 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::openal::DYLIB,
     &frameworks::opengles::DYLIB,
     &frameworks::security::DYLIB,
+    &frameworks::contacts::DYLIB,
+    &frameworks::pass_kit::DYLIB,
+    &frameworks::safari_services::DYLIB,
     &frameworks::store_kit::DYLIB,
     &frameworks::system_configuration::DYLIB,
     &frameworks::uikit::DYLIB,
@@ -222,7 +241,10 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::address_book::DYLIB,
     &frameworks::accounts::DYLIB,
     &frameworks::game_controller::DYLIB,
+    &LIBRESOLV,
     &CORE_AUDIO,
+    &frameworks::media_toolbox::DYLIB,
+    &frameworks::web_kit::DYLIB,
     &CF_NETWORK,
     &MOBILE_CORE_SERVICES,
     &CORE_MEDIA,
@@ -244,6 +266,10 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::core_bluetooth::DYLIB,
     &frameworks::gl_kit::DYLIB,
     &frameworks::image_io::DYLIB,
+    &frameworks::photos::DYLIB,
+    &frameworks::quick_look::DYLIB,
+    &frameworks::watch_connectivity::DYLIB,
+    &frameworks::xsapitcui::DYLIB,
 ];
 
 #[cfg(test)]

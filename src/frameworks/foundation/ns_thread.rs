@@ -16,8 +16,8 @@ use crate::libc::pthread::thread::{
 };
 use crate::mem::{guest_size_of, Mem, MutPtr};
 use crate::objc::{
-    id, msg_send, msg_send_no_type_checking, nil, objc_classes, release, retain,
-    Class, ClassExports, HostObject, NSZonePtr, SEL,
+    id, msg_send, msg_send_no_type_checking, nil, objc_classes, release, retain, Class,
+    ClassExports, HostObject, NSZonePtr, SEL,
 };
 use crate::Environment;
 use crate::{msg, msg_class};
@@ -154,7 +154,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (())sleepForTimeInterval:(NSTimeInterval)ti {
     log_dbg!("[NSThread sleepForTimeInterval:{:?}]", ti);
     if let Some(d) = ns_time_interval_to_duration(ti) {
-        env.sleep(d);
+        env.sleep_guest(d);
     } else {
         log!(
             "Warning: [NSThread sleepForTimeInterval:{:?}] given an out-of-range \
@@ -168,7 +168,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let ti: NSTimeInterval = msg![env; date timeIntervalSinceNow];
     if let Some(d) = ns_time_interval_to_duration(ti) {
         if !d.is_zero() {
-            env.sleep(d);
+            env.sleep_guest(d);
         }
     } else {
         log!(

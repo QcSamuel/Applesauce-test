@@ -12,12 +12,25 @@ use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, TrivialHo
 pub struct State {
     main_screen: Option<id>,
     current_mode: Option<id>,
+    /// `-brightness`, clamped to the documented 0.0-1.0 range.
+    brightness: CGFloat,
+    /// `-wantsSoftwareDimming`.
+    wants_software_dimming: bool,
+}
+
+/// Return the main screen's physical pixel size for the current orientation.
+/// UIKit `bounds` is expressed in logical points; `nativeBounds` and
+/// `UIScreenMode.size` are expressed in pixels.
+fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (CGFloat, CGFloat) {
+    let (width, height) = screen_size_for_current_orientation(env);
+    let scale = env.window().screen_scale() as CGFloat;
+    (width as CGFloat * scale, height as CGFloat * scale)
 }
 
 fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u32) {
     let (portrait_width, portrait_height) = env.window().device_family().portrait_size();
 
-    if std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
         let is_landscape = !matches!(
             env.window().current_rotation(),
             crate::window::DeviceOrientation::Portrait
@@ -29,6 +42,18 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     }
 
     (portrait_width, portrait_height)
+}
+
+/// Per Apple documentation for `-setBrightness:`, values are clamped to the
+/// documented 0.0-1.0 range by the setter below.
+fn clamp_brightness(value: CGFloat) -> CGFloat {
+    if value < 0.0 {
+        0.0
+    } else if value > 1.0 {
+        1.0
+    } else {
+        value
+    }
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -69,7 +94,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
-    if std::env::var_os("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS").is_some() {
+    if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
         log!(
             "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
             width,
@@ -87,7 +112,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGRect)nativeBounds {
     // Same as bounds at scale 1 — we don't model the physical pixel grid.
-    msg![env; this bounds]
+    // nativeBounds is the physical screen in pixels (bounds.size * scale);
+    // aliasing it to point-sized bounds made games render at half resolution
+    // on Retina device profiles.
+    let bounds: CGRect = msg![env; this bounds];
+    let scale = env.window().screen_scale() as CGFloat;
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize {
+            width:  bounds.size.width as CGFloat * scale,
+            height: bounds.size.height as CGFloat * scale,
+        },
+    }
 }
 
 - (CGRect)applicationFrame {
@@ -107,35 +143,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (CGFloat)nativeScale {
-    // Physical pixels == points for our purposes.
-    1.0
+    // On real iOS devices nativeScale equals scale (the point-to-pixel
+    // ratio of the physical display). Games use it to detect Retina and
+    // size their framebuffers; reporting 1.0 while `scale` reports 2.0
+    // made such games allocate a half-resolution framebuffer and draw
+    // zoomed / cropped.
+    env.window().screen_scale() as CGFloat
 }
 
 // MARK: - Brightness
 
 - (CGFloat)brightness {
-    1.0
+    env.framework_state.uikit.ui_screen.brightness
 }
 
-- (())setBrightness:(CGFloat)_brightness {
-    log!("TODO: [UIScreen setBrightness:] (not implemented)");
+- (())setBrightness:(CGFloat)brightness {
+    // Per Apple documentation, brightness is in the range 0.0 (darkest)
+    // to 1.0 (lightest); clamp out-of-range values like the real UIKit.
+    let clamped = clamp_brightness(brightness);
+    if clamped != env.framework_state.uikit.ui_screen.brightness {
+        log!(
+            "[UIScreen setBrightness:] {} -> {} (host display unaffected)",
+            env.framework_state.uikit.ui_screen.brightness,
+            clamped
+        );
+        env.framework_state.uikit.ui_screen.brightness = clamped;
+    }
 }
 
 - (bool)wantsSoftwareDimming {
-    false
+    env.framework_state.uikit.ui_screen.wants_software_dimming
 }
 
-- (())setWantsSoftwareDimming:(bool)_value {
-    log!("TODO: [UIScreen setWantsSoftwareDimming:] (not implemented)");
+- (())setWantsSoftwareDimming:(bool)value {
+    // Per Apple documentation this only selects whether brightness changes
+    // are implemented by dimming; store the preference.
+    env.framework_state.uikit.ui_screen.wants_software_dimming = value;
 }
 
 // MARK: - Display mode / overscan
 
 - (id)currentMode {
+    // `UIScreenMode.size` is in *pixels*, not points (it is the size of the
+    // framebuffer the screen is currently rendering at). On a real device
+    // this is `bounds.size * scale` — e.g. 640x960 on a Retina iPhone 4
+    // whose `bounds` are 320x480 points. We used to report the point size,
+    // which made engines that size their renderbuffer/projection from
+    // `currentMode.size` (Gameloft's Dust engine — N.O.V.A. 3, Firemint,
+    // …) allocate a viewport of half (or quarter) the EAGL renderbuffer
+    // area and draw the scene into a corner of the screen on Retina
+    // device profiles.
     let (width, height) = screen_size_for_current_orientation(env);
+    let scale = env.window().screen_scale() as CGFloat;
     let size = CGSize {
-        width:  width  as CGFloat,
-        height: height as CGFloat,
+        width:  width  as CGFloat * scale,
+        height: height as CGFloat * scale,
     };
 
     crate::frameworks::uikit::ui_screen_mode::from_size(env, size, 1.0)

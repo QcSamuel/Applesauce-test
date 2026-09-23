@@ -170,7 +170,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad");
     }
     // ULTRAHLE_MINIONJUMP_MODEL_END
@@ -193,7 +193,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad");
     }
     // ULTRAHLE_MINIONJUMP_NAME_END
@@ -212,7 +212,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     ns_string::get_static_str(env, "iPhone OS")
 }
 - (id)systemVersion {
-    ns_string::get_static_str(env, "6.1")
+    let (major, minor, patch) = env
+        .options
+        .as_ref()
+        .ios_version
+        .unwrap_or(crate::options::LATEST_IOS_VERSION);
+    ns_string::from_rust_string(env, format!("{major}.{minor}.{patch}"))
 }
 - (id)uniqueIdentifier {
     ns_string::get_static_str(env, "touchHLEdevice..........................")
@@ -270,7 +275,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return UIUserInterfaceIdiomPad;
     }
     // ULTRAHLE_MINIONJUMP_IDIOM_END
@@ -338,7 +343,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad2,1");
     }
     // ULTRAHLE_MINIONJUMP_PLATFORM_END
@@ -356,7 +361,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if matches!(
         env.bundle.bundle_identifier(),
         "com.apprisetec9.minionjump" | "com.risinghighapps.kingdomprincepro"
-    ) || std::env::var_os("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY").is_some() {
+    ) || crate::env_flag_cached!("TOUCHHLE_FORCE_IPAD_DEVICE_IDENTITY") {
         return ns_string::get_static_str(env, "iPad2,1");
     }
     // ULTRAHLE_MINIONJUMP_HWMODEL_END

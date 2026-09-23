@@ -50,6 +50,7 @@ fn main() {
             "GL_OES_rgb8_rgba8",
             "GL_EXT_texture_filter_anisotropic",
             "GL_IMG_texture_compression_pvrtc",
+            "GL_EXT_discard_framebuffer",
             "GL_EXT_texture_lod_bias",
             "GL_EXT_texture_format_BGRA8888",
             "GL_OES_draw_texture",
@@ -81,9 +82,13 @@ fn main() {
             "GL_OES_packed_depth_stencil",
             "GL_EXT_texture_filter_anisotropic",
             "GL_IMG_texture_compression_pvrtc",
+            "GL_EXT_discard_framebuffer",
             "GL_EXT_texture_format_BGRA8888",
             "GL_OES_mapbuffer",
             "GL_OES_vertex_array_object",
+            // ES 2.0 query objects are exposed by this extension on drivers
+            // that support boolean occlusion queries.
+            "GL_EXT_occlusion_query_boolean",
             // GL_APPLE_framebuffer_multisample provides the native
             // glRenderbufferStorageMultisampleAPPLE /
             // glResolveMultisampleFramebufferAPPLE entry points (and the

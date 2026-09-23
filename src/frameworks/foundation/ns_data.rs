@@ -183,7 +183,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
     let path_str = to_rust_string(env, path);
-    let Ok(bytes) = env.fs.read(GuestPath::new(&path_str)) else {
+    let bytes = env.fs.read(GuestPath::new(&path_str)).ok();
+    let Some(bytes) = bytes else {
         log_dbg!("NSData: Failed to read file at {:?}", path_str);
         release(env, this);
         return nil;

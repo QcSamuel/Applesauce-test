@@ -12,8 +12,18 @@
 use crate::{msg, Environment};
 use std::time::Instant;
 
-use crate::dyld::HostConstant;
+use crate::dyld::{export_c_func, FunctionExports, HostConstant};
+use crate::frameworks::core_graphics::cg_geometry::CGSize;
 use crate::mem::{ConstVoidPtr, MutPtr};
+
+/// HyperHLE does not emulate an active iOS Guided Access session.
+fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
+    false
+}
+
+const FUNCTIONS: FunctionExports = &[
+    export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
+];
 
 pub mod ui_accelerometer;
 pub mod ui_action_sheet;
@@ -26,6 +36,7 @@ pub mod ui_custom_object;
 pub mod ui_device;
 pub mod ui_document;
 pub mod ui_event;
+pub mod ui_bezier_path;
 pub mod ui_font;
 pub mod ui_geometry;
 pub mod ui_gesture_recognizer;
@@ -33,6 +44,7 @@ pub mod ui_graphics;
 pub mod ui_image;
 pub mod ui_image_picker_controller;
 pub mod ui_keyboard;
+pub mod ui_launch_delegate;
 pub mod ui_layout_placeholders;
 pub mod ui_local_notification;
 pub mod ui_navigation_bar;
@@ -48,6 +60,7 @@ pub mod ui_search_bar;
 pub mod ui_split_view_controller;
 pub mod ui_storyboard;
 pub mod ui_tab_bar_controller;
+pub mod ui_text_input;
 pub mod ui_tab_bar_item;
 pub mod ui_touch;
 pub mod ui_view;
@@ -218,10 +231,25 @@ fn uia_trait_tab_bar(env: &mut Environment) -> ConstVoidPtr {
     write_uiaccessibility_trait(env, 1 << 18)
 }
 
+fn ui_layout_fitting_size(env: &mut Environment, width: f32, height: f32) -> ConstVoidPtr {
+    env.mem
+        .alloc_and_write(crate::frameworks::core_graphics::CGSize { width, height })
+        .cast()
+        .cast_const()
+}
+
 pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIBackgroundTaskInvalid",
         HostConstant::Custom(ui_background_task_invalid),
+    ),
+    (
+        "_UILayoutFittingCompressedSize",
+        HostConstant::Custom(|env| ui_layout_fitting_size(env, 0.0, 0.0)),
+    ),
+    (
+        "_UILayoutFittingExpandedSize",
+        HostConstant::Custom(|env| ui_layout_fitting_size(env, -1.0, -1.0)),
     ),
     (
         "_UIImagePickerControllerOriginalImage",
@@ -899,6 +927,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_alert_controller::CLASSES,
         ui_application::CLASSES,
         ui_color::CLASSES,
+        ui_bezier_path::CLASSES,
         ui_custom_object::CLASSES,
         ui_device::CLASSES,
         ui_document::CLASSES,
@@ -908,6 +937,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_image::CLASSES,
         ui_image_picker_controller::CLASSES,
         ui_keyboard::CLASSES,
+        ui_launch_delegate::CLASSES,
         ui_local_notification::CLASSES,
         ui_navigation_bar::CLASSES,
         ui_nib::CLASSES,
@@ -938,6 +968,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_image_view::CLASSES,
         ui_view::ui_label::CLASSES,
         ui_view::ui_page_control::CLASSES,
+        ui_view::ui_refresh_control::CLASSES,
+        ui_text_input::CLASSES,
         ui_view::ui_picker_view::CLASSES,
         ui_view::ui_scroll_view::CLASSES,
         ui_view::ui_scroll_view::ui_text_view::CLASSES,
@@ -961,6 +993,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         CONSTANTS,
     ],
     function_exports: &[
+        FUNCTIONS,
         ui_application::FUNCTIONS,
         ui_geometry::FUNCTIONS,
         ui_graphics::FUNCTIONS,
@@ -980,6 +1013,7 @@ pub struct State {
     ui_graphics: ui_graphics::State,
     ui_image: ui_image::State,
     ui_keyboard: ui_keyboard::State,
+    ui_launch_delegate: ui_launch_delegate::State,
     ui_screen: ui_screen::State,
     ui_touch: ui_touch::State,
     pub ui_view: ui_view::State,
@@ -1016,26 +1050,37 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 ui_touch::handle_event(env, event)
             }
             Event::AppWillResignActive => {
-                // Getting this event means touchHLE is becoming inactive, e.g.
-                // due to switching apps. The obvious way to handle this would
-                // be to just send `applicationWillResignActive:` to the
-                // UIApplicationDelegate. However:
-                // - touchHLE's event loop can't handle an inactive app well
-                //   right now. For example, audio isn't paused.
-                // - touchHLE's event loop can't handle the subsequent
-                //   termination of an app right now: it doesn't manage to send
-                //   the `applicationWillTerminate:` message in time. This can
-                //   mean loss of data!
-                // Therefore, for the moment we will simulate the early iOS
-                // behavior where switching app usually resulted in termination.
-                // We can usually handle this in time, so there won't be data
-                // loss, nor problems with background resource usage or audio.
-                // TODO: Handle this better.
-                log!("Handling app-will-resign-active event: exiting.");
-                ui_application::exit(env);
+                // touchHLE has become inactive (e.g. the user is switching
+                // apps, a system dialog took focus, the screen is turning
+                // off, etc.). Per Apple's UIApplicationDelegate lifecycle
+                // docs, notify the app delegate so it can pause its game
+                // logic, save state, etc., but DO NOT terminate the process.
+                // On Android the SDL event pump will block on the resume
+                // semaphore once the activity finishes pausing, so the
+                // emulator will pause naturally and resume when the user
+                // returns; only `AppWillTerminate` (Android `onDestroy`) is
+                // treated as a real shutdown.
+                // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillresignactive(_:)
+                log_dbg!("Handling app-will-resign-active event.");
+                ui_application::handle_will_resign_active(env);
+            }
+            Event::AppDidEnterBackground => {
+                // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidenterbackground(_:)
+                log_dbg!("Handling app-did-enter-background event.");
+                ui_application::handle_did_enter_background(env);
+            }
+            Event::AppWillEnterForeground => {
+                // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillenterforeground(_:)
+                log_dbg!("Handling app-will-enter-foreground event.");
+                ui_application::handle_will_enter_foreground(env);
+            }
+            Event::AppDidBecomeActive => {
+                // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidbecomeactive(_:)
+                log_dbg!("Handling app-did-become-active event.");
+                ui_application::handle_did_become_active(env);
             }
             Event::AppWillTerminate => {
-                log!("Handling app-will-terminate event.");
+                log_dbg!("Handling app-will-terminate event.");
                 ui_application::exit(env);
             }
             Event::EnterDebugger => {
@@ -1070,4 +1115,16 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
     }
 
     ui_accelerometer::handle_accelerometer(env)
+}
+
+#[cfg(test)]
+mod accessibility_export_tests {
+    #[test]
+    fn guided_access_query_is_exported_as_a_function() {
+        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+            .flat_map(|table| table.iter())
+            .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
+            .collect();
+        assert_eq!(exports.len(), 1);
+    }
 }

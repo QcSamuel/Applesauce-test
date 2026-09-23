@@ -275,8 +275,13 @@ extern "C" {
     pub fn xmlCheckVersion(version: c_int);
 
     // ------------------------ Memory ------------------------------------
+    // libxml2 exports xmlFree/xmlMalloc as function-pointer VARIABLES (or
+    // thread-local accessor macros), not functions. Calling those symbols
+    // directly branches into data memory and can SIGSEGV. Resolve them in
+    // C using libxml2's headers, then call the real shim functions from Rust.
+    #[link_name = "hxml_free"]
     pub fn xmlFree(ptr: *mut c_void);
-    pub fn hxml_free(ptr: *mut c_void);
+    #[link_name = "hxml_malloc"]
     pub fn xmlMalloc(size: usize) -> *mut c_void;
     pub fn xmlMemoryDump() -> c_int;
     /// `xmlInitMemory(void)` — initialises libxml2's allocator override
@@ -329,11 +334,7 @@ extern "C" {
         encoding: *const c_char,
         options: c_int,
     ) -> *mut xmlDoc;
-    pub fn xmlReadFile(
-        url: *const c_char,
-        encoding: *const c_char,
-        options: c_int,
-    ) -> *mut xmlDoc;
+    pub fn xmlReadFile(url: *const c_char, encoding: *const c_char, options: c_int) -> *mut xmlDoc;
     pub fn xmlReadMemory(
         buf: *const c_char,
         size: c_int,
@@ -412,11 +413,7 @@ extern "C" {
     pub fn xmlFreeNode(cur: *mut xmlNode);
     pub fn xmlFreeNodeList(cur: *mut xmlNode);
     pub fn xmlCopyNode(node: *mut xmlNode, recursive: c_int) -> *mut xmlNode;
-    pub fn xmlDocCopyNode(
-        node: *mut xmlNode,
-        doc: *mut xmlDoc,
-        recursive: c_int,
-    ) -> *mut xmlNode;
+    pub fn xmlDocCopyNode(node: *mut xmlNode, doc: *mut xmlDoc, recursive: c_int) -> *mut xmlNode;
     pub fn xmlReplaceNode(old: *mut xmlNode, cur: *mut xmlNode) -> *mut xmlNode;
     pub fn xmlNodeSetName(cur: *mut xmlNode, name: *const xmlChar);
     pub fn xmlNodeSetContent(cur: *mut xmlNode, content: *const xmlChar);
@@ -483,12 +480,9 @@ extern "C" {
         name: *const xmlChar,
         ns: *const xmlChar,
     ) -> *mut xmlAttr;
-    pub fn xmlNewNs(node: *mut xmlNode, href: *const xmlChar, prefix: *const xmlChar) -> *mut xmlNs;
-    pub fn xmlSearchNs(
-        doc: *mut xmlDoc,
-        node: *mut xmlNode,
-        prefix: *const xmlChar,
-    ) -> *mut xmlNs;
+    pub fn xmlNewNs(node: *mut xmlNode, href: *const xmlChar, prefix: *const xmlChar)
+        -> *mut xmlNs;
+    pub fn xmlSearchNs(doc: *mut xmlDoc, node: *mut xmlNode, prefix: *const xmlChar) -> *mut xmlNs;
     pub fn xmlSearchNsByHref(
         doc: *mut xmlDoc,
         node: *mut xmlNode,
@@ -549,10 +543,7 @@ extern "C" {
         local_name: *const xmlChar,
         namespace_uri: *const xmlChar,
     ) -> *mut xmlChar;
-    pub fn xmlTextReaderMoveToAttribute(
-        reader: *mut xmlTextReader,
-        name: *const xmlChar,
-    ) -> c_int;
+    pub fn xmlTextReaderMoveToAttribute(reader: *mut xmlTextReader, name: *const xmlChar) -> c_int;
     pub fn xmlTextReaderMoveToFirstAttribute(reader: *mut xmlTextReader) -> c_int;
     pub fn xmlTextReaderMoveToNextAttribute(reader: *mut xmlTextReader) -> c_int;
     pub fn xmlTextReaderMoveToElement(reader: *mut xmlTextReader) -> c_int;
@@ -574,10 +565,7 @@ extern "C" {
         ns_uri: *const xmlChar,
     ) -> c_int;
     pub fn xmlXPathRegisteredNsCleanup(ctx: *mut xmlXPathContext);
-    pub fn xmlXPathEval(
-        expr: *const xmlChar,
-        ctx: *mut xmlXPathContext,
-    ) -> *mut xmlXPathObject;
+    pub fn xmlXPathEval(expr: *const xmlChar, ctx: *mut xmlXPathContext) -> *mut xmlXPathObject;
     pub fn xmlXPathEvalExpression(
         expr: *const xmlChar,
         ctx: *mut xmlXPathContext,
@@ -611,11 +599,7 @@ extern "C" {
     pub fn xmlNewValidCtxt() -> *mut xmlValidCtxt;
     pub fn xmlFreeValidCtxt(ctxt: *mut xmlValidCtxt);
     pub fn xmlValidateDocument(ctxt: *mut xmlValidCtxt, doc: *mut xmlDoc) -> c_int;
-    pub fn xmlValidateDtd(
-        ctxt: *mut xmlValidCtxt,
-        doc: *mut xmlDoc,
-        dtd: *mut xmlDtd,
-    ) -> c_int;
+    pub fn xmlValidateDtd(ctxt: *mut xmlValidCtxt, doc: *mut xmlDoc, dtd: *mut xmlDtd) -> c_int;
     pub fn xmlParseDTD(externalID: *const xmlChar, systemID: *const xmlChar) -> *mut xmlDtd;
     pub fn xmlFreeDtd(cur: *mut xmlDtd);
     pub fn xmlNewDtd(
@@ -639,17 +623,12 @@ extern "C" {
         filename: *const c_char,
         options: c_int,
     ) -> c_int;
-    pub fn xmlSchemaValidateOneElement(
-        ctxt: *mut xmlSchemaValidCtxt,
-        elem: *mut xmlNode,
-    ) -> c_int;
+    pub fn xmlSchemaValidateOneElement(ctxt: *mut xmlSchemaValidCtxt, elem: *mut xmlNode) -> c_int;
 
     // ------------------------ Relax-NG (relaxng.h) ----------------------
     pub fn xmlRelaxNGNewParserCtxt(url: *const c_char) -> *mut xmlRelaxNGParserCtxt;
-    pub fn xmlRelaxNGNewMemParserCtxt(
-        buf: *const c_char,
-        size: c_int,
-    ) -> *mut xmlRelaxNGParserCtxt;
+    pub fn xmlRelaxNGNewMemParserCtxt(buf: *const c_char, size: c_int)
+        -> *mut xmlRelaxNGParserCtxt;
     pub fn xmlRelaxNGFreeParserCtxt(ctxt: *mut xmlRelaxNGParserCtxt);
     pub fn xmlRelaxNGParse(ctxt: *mut xmlRelaxNGParserCtxt) -> *mut xmlRelaxNG;
     pub fn xmlRelaxNGFree(schema: *mut xmlRelaxNG);
@@ -671,10 +650,7 @@ extern "C" {
         options: c_int,
     ) -> *mut xmlSchematronValidCtxt;
     pub fn xmlSchematronFreeValidCtxt(ctxt: *mut xmlSchematronValidCtxt);
-    pub fn xmlSchematronValidateDoc(
-        ctxt: *mut xmlSchematronValidCtxt,
-        doc: *mut xmlDoc,
-    ) -> c_int;
+    pub fn xmlSchematronValidateDoc(ctxt: *mut xmlSchematronValidCtxt, doc: *mut xmlDoc) -> c_int;
 
     // ------------------------ Catalogs (catalog.h) ----------------------
     pub fn xmlLoadCatalog(filename: *const c_char) -> c_int;
@@ -699,11 +675,7 @@ extern "C" {
 
     // ------------------------ Save / serialize (xmlsave.h, tree.h) -------
     pub fn xmlSaveFile(filename: *const c_char, cur: *mut xmlDoc) -> c_int;
-    pub fn xmlSaveFormatFile(
-        filename: *const c_char,
-        cur: *mut xmlDoc,
-        format: c_int,
-    ) -> c_int;
+    pub fn xmlSaveFormatFile(filename: *const c_char, cur: *mut xmlDoc, format: c_int) -> c_int;
     pub fn xmlSaveFileEnc(
         filename: *const c_char,
         cur: *mut xmlDoc,
@@ -762,10 +734,7 @@ extern "C" {
         standalone: *const c_char,
     ) -> c_int;
     pub fn xmlTextWriterEndDocument(writer: *mut xmlTextWriter) -> c_int;
-    pub fn xmlTextWriterStartElement(
-        writer: *mut xmlTextWriter,
-        name: *const xmlChar,
-    ) -> c_int;
+    pub fn xmlTextWriterStartElement(writer: *mut xmlTextWriter, name: *const xmlChar) -> c_int;
     pub fn xmlTextWriterStartElementNS(
         writer: *mut xmlTextWriter,
         prefix: *const xmlChar,
@@ -774,14 +743,8 @@ extern "C" {
     ) -> c_int;
     pub fn xmlTextWriterEndElement(writer: *mut xmlTextWriter) -> c_int;
     pub fn xmlTextWriterFullEndElement(writer: *mut xmlTextWriter) -> c_int;
-    pub fn xmlTextWriterWriteString(
-        writer: *mut xmlTextWriter,
-        content: *const xmlChar,
-    ) -> c_int;
-    pub fn xmlTextWriterWriteRaw(
-        writer: *mut xmlTextWriter,
-        content: *const xmlChar,
-    ) -> c_int;
+    pub fn xmlTextWriterWriteString(writer: *mut xmlTextWriter, content: *const xmlChar) -> c_int;
+    pub fn xmlTextWriterWriteRaw(writer: *mut xmlTextWriter, content: *const xmlChar) -> c_int;
     pub fn xmlTextWriterWriteAttribute(
         writer: *mut xmlTextWriter,
         name: *const xmlChar,
@@ -794,14 +757,8 @@ extern "C" {
         ns_uri: *const xmlChar,
         content: *const xmlChar,
     ) -> c_int;
-    pub fn xmlTextWriterWriteComment(
-        writer: *mut xmlTextWriter,
-        content: *const xmlChar,
-    ) -> c_int;
-    pub fn xmlTextWriterWriteCDATA(
-        writer: *mut xmlTextWriter,
-        content: *const xmlChar,
-    ) -> c_int;
+    pub fn xmlTextWriterWriteComment(writer: *mut xmlTextWriter, content: *const xmlChar) -> c_int;
+    pub fn xmlTextWriterWriteCDATA(writer: *mut xmlTextWriter, content: *const xmlChar) -> c_int;
     pub fn xmlTextWriterWritePI(
         writer: *mut xmlTextWriter,
         target: *const xmlChar,
@@ -809,10 +766,7 @@ extern "C" {
     ) -> c_int;
     pub fn xmlTextWriterFlush(writer: *mut xmlTextWriter) -> c_int;
     pub fn xmlTextWriterSetIndent(writer: *mut xmlTextWriter, indent: c_int) -> c_int;
-    pub fn xmlTextWriterSetIndentString(
-        writer: *mut xmlTextWriter,
-        s: *const xmlChar,
-    ) -> c_int;
+    pub fn xmlTextWriterSetIndentString(writer: *mut xmlTextWriter, s: *const xmlChar) -> c_int;
 
     // ------------------------ Buffer ------------------------------------
     pub fn xmlBufferCreate() -> *mut xmlBuffer;
@@ -825,11 +779,8 @@ extern "C" {
     pub fn xmlBufferCat(buf: *mut xmlBuffer, s: *const xmlChar) -> c_int;
 
     // ------------------------ HTML parser / tree -----------------------
-    pub fn htmlReadFile(
-        url: *const c_char,
-        encoding: *const c_char,
-        options: c_int,
-    ) -> *mut xmlDoc;
+    pub fn htmlReadFile(url: *const c_char, encoding: *const c_char, options: c_int)
+        -> *mut xmlDoc;
     pub fn htmlReadMemory(
         buf: *const c_char,
         size: c_int,
@@ -1012,3 +963,6 @@ fn _ensure_constants_in_scope() {
     let _ = html_parser_option::HTML_PARSE_RECOVER;
     let _: c_uint = 0;
 }
+
+#[cfg(test)]
+mod tests;

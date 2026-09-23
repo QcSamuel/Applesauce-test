@@ -13,6 +13,7 @@
 pub mod ca_animation;
 pub mod ca_display_link;
 pub mod ca_eagl_layer;
+pub mod ca_gradient_layer;
 pub mod ca_keyframe_animation; // <-- ДОБАВЛЕН НОВЫЙ МОДУЛЬ
 pub mod ca_layer;
 pub mod ca_media_timing_function;
@@ -30,7 +31,6 @@ use crate::frameworks::core_foundation::time::CFTimeInterval;
 use crate::frameworks::core_graphics::CGFloat;
 use crate::mem::SafeRead;
 use crate::Environment;
-use std::time::Instant;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     // Core Animation is considered its own framework, but it technically lives
@@ -42,6 +42,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ca_animation::CLASSES,
         ca_display_link::CLASSES,
         ca_eagl_layer::CLASSES,
+        ca_gradient_layer::CLASSES,
         ca_keyframe_animation::CLASSES, // <-- КЛАСС ЭКСПОРТИРОВАН
         ca_layer::CLASSES,
         ca_media_timing_function::CLASSES,
@@ -65,14 +66,14 @@ pub struct State {
     ca_media_timing_function: ca_media_timing_function::State,
     ca_transaction: ca_transaction::State,
     composition: composition::State,
+    gradients: ca_gradient_layer::State,
 }
 
-// This function should call mach_absolute_time() and convert the result into
-// seconds. Since in our implementation, mach_absolute_time() returns, in
-// nanoseconds, Instant::now, we can just do the same in seconds and save
-// the calls to the guest functions.
+// Use the same virtual monotonic clock as mach_absolute_time(), but return
+// seconds rather than nanoseconds. Both clocks remain continuous when the
+// user changes game speed.
 pub fn CACurrentMediaTime(env: &mut Environment) -> CFTimeInterval {
-    Instant::now()
+    env.guest_clock.now()
         .duration_since(env.startup_time)
         .as_secs_f64()
 }
@@ -138,33 +139,4 @@ impl GuestArg for CATransform3D {
 }
 impl_GuestRet_for_large_struct!(CATransform3D);
 
-fn CATransform3DMakeScale(
-    _env: &mut Environment,
-    sx: CGFloat,
-    sy: CGFloat,
-    sz: CGFloat,
-) -> CATransform3D {
-    CATransform3D {
-        m11: sx,
-        m12: 0.0,
-        m13: 0.0,
-        m14: 0.0,
-        m21: 0.0,
-        m22: sy,
-        m23: 0.0,
-        m24: 0.0,
-        m31: 0.0,
-        m32: 0.0,
-        m33: sz,
-        m34: 0.0,
-        m41: 0.0,
-        m42: 0.0,
-        m43: 0.0,
-        m44: 1.0,
-    }
-}
-
-pub const FUNCTIONS: FunctionExports = &[
-    export_c_func!(CACurrentMediaTime()),
-    export_c_func!(CATransform3DMakeScale(_, _, _)),
-];
+pub const FUNCTIONS: FunctionExports = &[export_c_func!(CACurrentMediaTime())];

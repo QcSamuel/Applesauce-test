@@ -19,7 +19,7 @@ use crate::frameworks::core_audio_types::{
     fourcc, kAudioFormatFlagIsAlignedHigh, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
     kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM, AudioStreamBasicDescription,
 };
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, SafeRead};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
 
 const kAudioUnitType_Output: u32 = fourcc(b"auou");
 const kAudioUnitSubType_RemoteIO: u32 = fourcc(b"rioc");
@@ -108,9 +108,19 @@ pub struct AudioComponentInstanceHostObject {
     pub al_source: Option<ALuint>,
     pub is_running_handler: bool,
 
+    /// Property listeners registered through `AudioUnitAddPropertyListener`.
+    /// The callback is kept as a guest function and invoked with the same
+    /// ref-con that was supplied during registration.
+    pub property_listeners: Vec<(u32, GuestFunction, MutVoidPtr)>,
+
     // --- 3D Mixer State ---
     pub is_3d_mixer: bool,
     pub mixer_buses: HashMap<u32, MixerBusState>,
+
+    /// RemoteIO input element (element=1, scope=Input) enabled — the unit is
+    /// being used to capture microphone audio. Filled by
+    /// `AudioUnitRender` with real host-mic samples when available.
+    pub mic_input_enabled: bool,
 }
 
 impl Default for AudioComponentInstanceHostObject {
@@ -138,8 +148,10 @@ impl Default for AudioComponentInstanceHostObject {
             last_render_time: None,
             al_source: None,
             is_running_handler: false,
+            property_listeners: Vec::new(),
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),
+            mic_input_enabled: false,
         }
     }
 }

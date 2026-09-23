@@ -24,7 +24,9 @@ use crate::frameworks::uikit::ui_device::{
     UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
     UIDeviceOrientationPortraitUpsideDown,
 };
-use crate::objc::{id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports};
+use crate::objc::{
+    id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
+};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -138,8 +140,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, root_vc);
     }
     let list = &mut env.framework_state.uikit.ui_view.ui_window.windows;
-    let idx = list.iter().position(|&w| w == this).unwrap();
-    list.remove(idx);
+    // A window may be deallocated without ever being registered (e.g.
+    // `[[UIWindow alloc] init]`, which skips both designated initializers).
+    // Never panic on guest-driven paths.
+    if let Some(idx) = list.iter().position(|&w| w == this) {
+        list.remove(idx);
+    }
     log_dbg!(
         "Deallocating window {:?}. New list of all windows: {:?}",
         this,
@@ -194,16 +200,33 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setHidden:(bool)is_hidden {
     () = msg_super![env; this setHidden:is_hidden];
 
-    // TODO: post UIWindowDidBecomeVisibleNotification,
-    //            UIWindowDidBecomeHiddenNotification
+    let notif_name = ns_string::get_static_str(
+        env,
+        if is_hidden {
+            UIWindowDidBecomeHiddenNotification
+        } else {
+            UIWindowDidBecomeVisibleNotification
+        },
+    );
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    () = msg![env; center postNotificationName:notif_name object:this userInfo:nil];
+
     log_dbg!("[(UIWindow*){:?} setHidden:{:?}]", this, is_hidden);
 }
 
 - (())makeKeyWindow {
-    // TODO: post UIWindowDidResignKeyNotification for previous key window
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+
+    if let Some(previous) = env.framework_state.uikit.ui_view.ui_window.key_window {
+        if previous != this {
+            let notif_name =
+                ns_string::get_static_str(env, UIWindowDidResignKeyNotification);
+            () = msg![env; center postNotificationName:notif_name object:previous userInfo:nil];
+        }
+    }
+
     env.framework_state.uikit.ui_view.ui_window.key_window = Some(this);
 
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     let notif_name = ns_string::get_static_str(env, UIWindowDidBecomeKeyNotification);
     () = msg![env; center postNotificationName:notif_name object:this userInfo:nil];
 }
@@ -213,14 +236,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())makeKeyAndVisible {
-    // TODO: We don't currently have send any non-touch events to windows,
-    // so there's no meaning in it yet.
+    // MakeKeyVisibleFix (from XaViewDnK fork): some engines (e.g. Asphalt 8's
+    // Jet) create the window with a zero frame and only size it via
+    // `makeKeyAndVisible`. Without this, the window stays 0x0 and every
+    // layer composite is empty => black screen.
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let bounds: CGRect = msg![env; screen bounds];
+    let frame: CGRect = msg![env; this frame];
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        log!("Fixing empty window frame to {:?}", bounds);
+        () = msg![env; this setFrame:bounds];
+    }
 
-    // FIXME: This should also bump the window to the top of the list.
+    // Bump the window to the top of the touch list (was a FIXME upstream).
+    let list = &mut env.framework_state.uikit.ui_view.ui_window.windows;
+    if let Some(idx) = list.iter().position(|&w| w == this) {
+        let w = list.remove(idx);
+        list.push(w);
+    }
 
     () = msg![env; this makeKeyWindow];
-
-    // TODO: post UIWindowDidBecomeVisibleNotification
     () = msg![env; this setHidden:false];
 }
 
@@ -384,13 +419,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     //        three places (user/default options, setStatusBarOrientation: etc,
     //        Info.plist UIInterfaceOrientation etc). It's not clear if these
     //        are really equivalent and should all trigger autorotation.
-    if let Some(orientation) = match env.window.as_ref().unwrap().current_rotation() {
+    // `env.window` is `None` in headless mode; skip autorotation instead of
+    // unwrapping (which would panic the host).
+    let rotation = env.window.as_ref().map(|window| window.current_rotation());
+    if let Some(orientation) = rotation.and_then(|rotation| match rotation {
         crate::window::DeviceOrientation::LandscapeLeft => Some(UIDeviceOrientationLandscapeLeft),
         crate::window::DeviceOrientation::LandscapeRight => Some(UIDeviceOrientationLandscapeRight),
-        crate::window::DeviceOrientation::PortraitUpsideDown => Some(UIDeviceOrientationPortraitUpsideDown),
+        crate::window::DeviceOrientation::PortraitUpsideDown => {
+            Some(UIDeviceOrientationPortraitUpsideDown)
+        }
         // Portrait is the default so we don't do anything here.
         crate::window::DeviceOrientation::Portrait => None,
-    } {
+    }) {
         // (UIInterfaceOrientation and UIDeviceOrientation are compatible enums,
         //  here we use whichever is clearer contextually.)
         let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];

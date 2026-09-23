@@ -10,6 +10,7 @@ mod av_audio_player;
 pub mod av_audio_session;
 pub mod av_capture;
 pub mod av_player;
+pub mod av_speech;
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::objc::id;
@@ -69,10 +70,7 @@ pub const STUB_CONSTANTS: ConstantExports = &[
     // AVAudioRecorder settings dictionary keys (apps reach them through
     // Mach-O symbol lookup, so we expose them as NSString constants whose
     // identity matches Apple's value).
-    (
-        "_AVFormatIDKey",
-        HostConstant::NSString("AVFormatIDKey"),
-    ),
+    ("_AVFormatIDKey", HostConstant::NSString("AVFormatIDKey")),
     (
         "_AVSampleRateKey",
         HostConstant::NSString("AVSampleRateKey"),
@@ -116,15 +114,12 @@ pub const STUB_CONSTANTS: ConstantExports = &[
     // dictionary lookups (`outputSettings[AVVideoCodecKey]`) and
     // identity checks against the documented preset names.
     // -----------------------------------------------------------------
-    ("_AVVideoCodecKey", HostConstant::NSString("AVVideoCodecKey")),
     (
-        "_AVVideoCodecH264",
-        HostConstant::NSString("avc1"),
+        "_AVVideoCodecKey",
+        HostConstant::NSString("AVVideoCodecKey"),
     ),
-    (
-        "_AVVideoCodecJPEG",
-        HostConstant::NSString("jpeg"),
-    ),
+    ("_AVVideoCodecH264", HostConstant::NSString("avc1")),
+    ("_AVVideoCodecJPEG", HostConstant::NSString("jpeg")),
     (
         "_AVVideoCodecAppleProRes422",
         HostConstant::NSString("apcn"),
@@ -184,10 +179,7 @@ pub const STUB_CONSTANTS: ConstantExports = &[
         "_AVFileTypeQuickTimeMovie",
         HostConstant::NSString("com.apple.quicktime-movie"),
     ),
-    (
-        "_AVFileTypeMPEG4",
-        HostConstant::NSString("public.mpeg-4"),
-    ),
+    ("_AVFileTypeMPEG4", HostConstant::NSString("public.mpeg-4")),
     (
         "_AVFileTypeAppleM4V",
         HostConstant::NSString("com.apple.m4v-video"),
@@ -216,10 +208,7 @@ pub const STUB_CONSTANTS: ConstantExports = &[
         "_AVFileTypeAMR",
         HostConstant::NSString("org.3gpp.adaptive-multi-rate-audio"),
     ),
-    (
-        "_AVFileType3GPP",
-        HostConstant::NSString("public.3gpp"),
-    ),
+    ("_AVFileType3GPP", HostConstant::NSString("public.3gpp")),
     (
         "_AVFileTypeCoreAudioFormat",
         HostConstant::NSString("com.apple.coreaudio-format"),
@@ -325,6 +314,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         av_audio_session::CLASSES,
         av_capture::CLASSES,
         av_player::CLASSES,
+        av_speech::CLASSES,
     ],
     constant_exports: &[
         av_audio_session::CONSTANTS,

@@ -3,14 +3,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Stub for `CoreImage.framework/CoreImage`.
-//!
-//! CoreImage is the GPU-accelerated image-processing framework. iOS 5+
-//! apps reach a handful of `CIContext` / `CIFilter` constants by Mach-O
-//! symbol lookup even when they don't actually run any filters (they're
-//! often referenced from defensive `if (kCISomething != nil)` guards).
-//! Without a [crate::dyld::HostDylib] entry for these names, the linker
-//! leaves them NULL and the first dereference takes down the emulator.
+//! `CoreImage.framework`: CIColor, constants and a finite-image CPU pipeline.
+//! See `pipeline` for the explicitly supported filter set.
+
+pub mod pipeline;
 
 use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::CGFloat;
@@ -32,7 +28,10 @@ impl HostObject for CIColorHostObject {}
 
 /// Read RGBA components from a `CIColor`. Used by
 /// `+[UIColor colorWithCIColor:]`.
-pub fn ci_color_components(env: &crate::Environment, color: id) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+pub fn ci_color_components(
+    env: &crate::Environment,
+    color: id,
+) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
     let h = env.objc.borrow::<CIColorHostObject>(color);
     (h.red, h.green, h.blue, h.alpha)
 }
@@ -46,7 +45,10 @@ fn parse_ci_color_string(s: &str) -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)
     let r: CGFloat = parts.next()?.parse().ok()?;
     let g: CGFloat = parts.next()?.parse().ok()?;
     let b: CGFloat = parts.next()?.parse().ok()?;
-    let a: CGFloat = parts.next().map(|x| x.parse().unwrap_or(1.0)).unwrap_or(1.0);
+    let a: CGFloat = parts
+        .next()
+        .map(|x| x.parse().unwrap_or(1.0))
+        .unwrap_or(1.0);
     Some((r, g, b, a))
 }
 
@@ -194,50 +196,29 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString("kCIContextHighQualityDownsample"),
     ),
     // CIFilter input keys (the most common ones).
-    (
-        "_kCIInputImageKey",
-        HostConstant::NSString("inputImage"),
-    ),
+    ("_kCIInputImageKey", HostConstant::NSString("inputImage")),
     (
         "_kCIInputBackgroundImageKey",
         HostConstant::NSString("inputBackgroundImage"),
     ),
-    (
-        "_kCIInputTimeKey",
-        HostConstant::NSString("inputTime"),
-    ),
+    ("_kCIInputTimeKey", HostConstant::NSString("inputTime")),
     (
         "_kCIInputTransformKey",
         HostConstant::NSString("inputTransform"),
     ),
-    (
-        "_kCIInputScaleKey",
-        HostConstant::NSString("inputScale"),
-    ),
+    ("_kCIInputScaleKey", HostConstant::NSString("inputScale")),
     (
         "_kCIInputAspectRatioKey",
         HostConstant::NSString("inputAspectRatio"),
     ),
-    (
-        "_kCIInputCenterKey",
-        HostConstant::NSString("inputCenter"),
-    ),
-    (
-        "_kCIInputRadiusKey",
-        HostConstant::NSString("inputRadius"),
-    ),
-    (
-        "_kCIInputAngleKey",
-        HostConstant::NSString("inputAngle"),
-    ),
+    ("_kCIInputCenterKey", HostConstant::NSString("inputCenter")),
+    ("_kCIInputRadiusKey", HostConstant::NSString("inputRadius")),
+    ("_kCIInputAngleKey", HostConstant::NSString("inputAngle")),
     (
         "_kCIInputRefractionKey",
         HostConstant::NSString("inputRefraction"),
     ),
-    (
-        "_kCIInputWidthKey",
-        HostConstant::NSString("inputWidth"),
-    ),
+    ("_kCIInputWidthKey", HostConstant::NSString("inputWidth")),
     (
         "_kCIInputSharpnessKey",
         HostConstant::NSString("inputSharpness"),
@@ -246,18 +227,12 @@ pub const CONSTANTS: ConstantExports = &[
         "_kCIInputIntensityKey",
         HostConstant::NSString("inputIntensity"),
     ),
-    (
-        "_kCIInputEVKey",
-        HostConstant::NSString("inputEV"),
-    ),
+    ("_kCIInputEVKey", HostConstant::NSString("inputEV")),
     (
         "_kCIInputSaturationKey",
         HostConstant::NSString("inputSaturation"),
     ),
-    (
-        "_kCIInputColorKey",
-        HostConstant::NSString("inputColor"),
-    ),
+    ("_kCIInputColorKey", HostConstant::NSString("inputColor")),
     (
         "_kCIInputBrightnessKey",
         HostConstant::NSString("inputBrightness"),
@@ -278,15 +253,9 @@ pub const CONSTANTS: ConstantExports = &[
         "_kCIInputTargetImageKey",
         HostConstant::NSString("inputTargetImage"),
     ),
-    (
-        "_kCIInputExtentKey",
-        HostConstant::NSString("inputExtent"),
-    ),
+    ("_kCIInputExtentKey", HostConstant::NSString("inputExtent")),
     // CIFilter output key.
-    (
-        "_kCIOutputImageKey",
-        HostConstant::NSString("outputImage"),
-    ),
+    ("_kCIOutputImageKey", HostConstant::NSString("outputImage")),
     // Common filter category constants.
     (
         "_kCICategoryDistortionEffect",
@@ -340,10 +309,7 @@ pub const CONSTANTS: ConstantExports = &[
         "_kCICategorySharpen",
         HostConstant::NSString("CICategorySharpen"),
     ),
-    (
-        "_kCICategoryBlur",
-        HostConstant::NSString("CICategoryBlur"),
-    ),
+    ("_kCICategoryBlur", HostConstant::NSString("CICategoryBlur")),
     (
         "_kCICategoryVideo",
         HostConstant::NSString("CICategoryVideo"),

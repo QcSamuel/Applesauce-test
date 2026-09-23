@@ -9,6 +9,131 @@ use super::gles11_raw as gles11; // constants only
 use super::gles11_raw::types::{GLenum, GLfixed, GLfloat, GLint, GLsizei};
 use super::GLES;
 
+/// PERF OPTIMIZATION (loading): cache of recently decoded PVRTC textures.
+/// Unity apps commonly destroy and re-create the same compressed textures
+/// across scene transitions; decoding PVRTC is one of the biggest chunks of
+/// load time. Entries are keyed by (content hash, params), so a re-upload of
+/// identical payload skips the expensive software decode entirely.
+///
+/// The cache is bounded by a total-decoded-bytes budget to keep host memory
+/// usage predictable (decoded RGBA8 is 4-8x the compressed size).
+const PVRTC_CACHE_MAX_ENTRIES: usize = 12;
+const PVRTC_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+
+struct PvrtcCacheEntry {
+    key: u64,
+    is_2bit: bool,
+    // Identical compressed payloads decode differently for RGB and RGBA
+    // PVRTC, so this belongs in both memory and on-disk cache keys.
+    is_opaque: bool,
+    width: u32,
+    height: u32,
+    /// Decoded RGBA8 (one `u32` per texel, as returned by `decode_pvrtc`).
+    pixels: std::rc::Rc<[u32]>,
+}
+
+use std::cell::RefCell;
+thread_local! {
+    static PVRTC_DECODE_CACHE: RefCell<Vec<PvrtcCacheEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// FNV-1a 64-bit hash of the compressed payload.
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Host-side directory for the on-disk PVRTC decode cache. Decoding PVRTC on
+/// the CPU is one of the dominant startup costs for games that ship most of
+/// their textures compressed (e.g. Unity titles); persisting the decoded RGBA
+/// makes every subsequent launch of the same app skip the decode entirely.
+fn pvrtc_disk_cache_dir() -> Option<std::path::PathBuf> {
+    static CACHE_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    CACHE_DIR
+        .get_or_init(|| {
+            let dir = crate::paths::user_data_base_path().join("touchHLE_pvrtc_cache");
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => Some(dir),
+                Err(e) => {
+                    log!(
+                        "Warning: PVRTC disk cache disabled, can't create {}: {e}",
+                        dir.display()
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+fn pvrtc_disk_cache_path(
+    key: u64,
+    is_2bit: bool,
+    is_opaque: bool,
+    width: u32,
+    height: u32,
+) -> Option<std::path::PathBuf> {
+    pvrtc_disk_cache_dir().map(|dir| {
+        dir.join(format!(
+            "{:016x}-{}{}-{}x{}.rgba",
+            key,
+            if is_2bit { 2 } else { 4 },
+            if is_opaque { "o" } else { "a" },
+            width,
+            height
+        ))
+    })
+}
+
+fn pvrtc_disk_cache_load(
+    key: u64,
+    is_2bit: bool,
+    is_opaque: bool,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u32>> {
+    let path = pvrtc_disk_cache_path(key, is_2bit, is_opaque, width, height)?;
+    let data = std::fs::read(&path).ok()?;
+    let expected = (width as usize) * (height as usize) * std::mem::size_of::<u32>();
+    if data.len() != expected {
+        // Corrupt or stale entry from an older format — ignore it.
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(expected / std::mem::size_of::<u32>());
+    for chunk in data.chunks_exact(std::mem::size_of::<u32>()) {
+        pixels.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(pixels)
+}
+
+fn pvrtc_disk_cache_store(
+    key: u64,
+    is_2bit: bool,
+    is_opaque: bool,
+    width: u32,
+    height: u32,
+    pixels: &[u32],
+) {
+    let Some(path) = pvrtc_disk_cache_path(key, is_2bit, is_opaque, width, height) else {
+        return;
+    };
+    let mut bytes = Vec::with_capacity(pixels.len() * std::mem::size_of::<u32>());
+    for px in pixels {
+        bytes.extend_from_slice(&px.to_le_bytes());
+    }
+    // Write atomically (tmp + rename) so a crash mid-write can't leave a
+    // half-written entry that later fails the size check anyway.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// Convert a fixed-point scalar to a floating-point scalar.
 ///
 /// Beware: Rust's type checker won't complain if you mix up [GLfixed] with
@@ -51,6 +176,13 @@ pub enum ParamType {
     Float,
     /// `GLint`
     Int,
+    /// Normalized floating-point color components (RGBA in [0, 1]).
+    ///
+    /// Per the GLES 1.1 spec (Table 6.1, type "C"), color state is clamped
+    /// to [0, 1] on set; when queried with an integer getter the components
+    /// are scaled to the full integer range (see [ParamTable::get_type_info]
+    /// users), unlike plain `Float` state which is rounded to nearest.
+    Color,
     /// Placeholder type for things like colors which are floating-point
     /// but don't have the usual conversion behavior to/from integers etc.
     /// [ParamTable] will accept it for floating-point inputs only.
@@ -125,7 +257,9 @@ impl ParamTable {
         // On the other hand, fixed-to-float/float-to-fixed conversion is always
         // the same even for the weird float-ish values.
         match type_ {
-            ParamType::Float | ParamType::FloatSpecial => setf(fixed_to_float(param)),
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => {
+                setf(fixed_to_float(param))
+            }
             _ => seti(param),
         }
     }
@@ -150,7 +284,7 @@ impl ParamTable {
         match type_ {
             // Fixed-to-float/float-to-fixed conversion is always the same even
             // for the weird float-ish values.
-            ParamType::Float | ParamType::FloatSpecial => {
+            ParamType::Float | ParamType::Color | ParamType::FloatSpecial => {
                 let mut params_float = [0.0; 16]; // probably the max?
                 let params_float = &mut params_float[..usize::from(count)];
                 for (i, param_float) in params_float.iter_mut().enumerate() {
@@ -246,21 +380,194 @@ pub fn try_decode_pvrtc(
         return true;
     }
 
-    let pixels = crate::image::decode_pvrtc(pvrtc_data, is_2bit, width_u, height_u);
+    // RGB PVRTC is opaque by definition. Keep this discriminator in every
+    // cache key and force its decoded alpha channel to 0xff on a cache miss.
+    let is_opaque = matches!(
+        internalformat,
+        gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+    );
+    let upload_format = gles11::RGBA;
+
+    // Look up the decoded result in the cache before doing the (expensive)
+    // software decode.
+    let key = fnv1a_hash(pvrtc_data);
+    let cached = PVRTC_DECODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(pos) = cache.iter().position(|e| {
+            e.key == key
+                && e.is_2bit == is_2bit
+                && e.is_opaque == is_opaque
+                && e.width == width_u
+                && e.height == height_u
+        }) {
+            // Move-to-front for simple LRU behaviour.
+            let entry = cache.remove(pos);
+            cache.insert(0, entry);
+            let entry = &cache[0];
+            Some(entry.pixels.clone())
+        } else {
+            None
+        }
+    });
+
+    let pixels: std::rc::Rc<[u32]> = cached.unwrap_or_else(|| {
+        // Second-tier lookup: the persistent cache survives application
+        // restarts. Its key includes `is_opaque` so RGB and RGBA formats with
+        // the same compressed bytes never reuse each other's alpha channel.
+        let decoded: Vec<u32> = pvrtc_disk_cache_load(key, is_2bit, is_opaque, width_u, height_u)
+            .unwrap_or_else(|| {
+                let decoded = crate::image::decode_pvrtc_with_alpha(
+                    pvrtc_data,
+                    is_2bit,
+                    width_u,
+                    height_u,
+                    is_opaque,
+                );
+                pvrtc_disk_cache_store(key, is_2bit, is_opaque, width_u, height_u, &decoded);
+                decoded
+            });
+        let decoded: std::rc::Rc<[u32]> = decoded.into();
+        PVRTC_DECODE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            // Evict least-recently-used entries until the new entry fits
+            // within the entry-count and byte-budget limits.
+            let decoded_bytes = decoded.len() * std::mem::size_of::<u32>();
+            let mut total_bytes: usize = cache
+                .iter()
+                .map(|e| e.pixels.len() * std::mem::size_of::<u32>())
+                .sum();
+            while cache.len() >= PVRTC_CACHE_MAX_ENTRIES
+                || total_bytes + decoded_bytes > PVRTC_CACHE_MAX_BYTES
+            {
+                let Some(evicted) = cache.pop() else { break };
+                total_bytes -= evicted.pixels.len() * std::mem::size_of::<u32>();
+            }
+            cache.insert(
+                0,
+                PvrtcCacheEntry {
+                    key,
+                    is_2bit,
+                    is_opaque,
+                    width: width_u,
+                    height: height_u,
+                    pixels: decoded.clone(),
+                },
+            );
+        });
+        decoded
+    });
     unsafe {
         gles.TexImage2D(
             target,
             level,
-            gles11::RGBA as _,
+            upload_format as _,
             width,
             height,
             border,
-            gles11::RGBA,
+            upload_format,
             gles11::UNSIGNED_BYTE,
             pixels.as_ptr() as *const _,
         )
     };
     true
+}
+
+/// Convert an uncompressed guest texture to RGBA8888 so GLES backends do not
+/// depend on optional BGRA or packed-pixel upload support.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn decode_texture_to_rgba8(
+    width: GLsizei,
+    height: GLsizei,
+    format: GLenum,
+    type_: GLenum,
+    pixels: *const std::ffi::c_void,
+    unpack_alignment: GLint,
+) -> Option<Vec<u8>> {
+    if pixels.is_null() || width < 0 || height < 0 {
+        return None;
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let bytes_per_pixel = match type_ {
+        gles11::UNSIGNED_BYTE => match format {
+            gles11::ALPHA | gles11::LUMINANCE => 1,
+            gles11::LUMINANCE_ALPHA => 2,
+            gles11::RGB => 3,
+            gles11::RGBA | gles11::BGRA_EXT => 4,
+            _ => return None,
+        },
+        gles11::UNSIGNED_SHORT_5_6_5
+        | gles11::UNSIGNED_SHORT_4_4_4_4
+        | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
+        _ => return None,
+    };
+    let alignment = unpack_alignment.max(1) as usize;
+    let row_bytes = width.checked_mul(bytes_per_pixel)?;
+    let row_stride = row_bytes.checked_add(alignment - 1)? / alignment * alignment;
+    let output_len = width.checked_mul(height)?.checked_mul(4)?;
+    let mut output = vec![0u8; output_len];
+    for y in 0..height {
+        let row = (pixels as *const u8).add(y * row_stride);
+        for x in 0..width {
+            let src = row.add(x * bytes_per_pixel);
+            let dst = output.as_mut_ptr().add((y * width + x) * 4);
+            let (r, g, b, a) = match type_ {
+                gles11::UNSIGNED_BYTE => match format {
+                    gles11::ALPHA => (255, 255, 255, src.read()),
+                    gles11::LUMINANCE => {
+                        let l = src.read();
+                        (l, l, l, 255)
+                    }
+                    gles11::LUMINANCE_ALPHA => {
+                        let l = src.read();
+                        (l, l, l, src.add(1).read())
+                    }
+                    gles11::RGB => (src.read(), src.add(1).read(), src.add(2).read(), 255),
+                    gles11::RGBA => (
+                        src.read(),
+                        src.add(1).read(),
+                        src.add(2).read(),
+                        src.add(3).read(),
+                    ),
+                    gles11::BGRA_EXT => (
+                        src.add(2).read(),
+                        src.add(1).read(),
+                        src.read(),
+                        src.add(3).read(),
+                    ),
+                    _ => return None,
+                },
+                gles11::UNSIGNED_SHORT_5_6_5
+                | gles11::UNSIGNED_SHORT_4_4_4_4
+                | gles11::UNSIGNED_SHORT_5_5_5_1 => {
+                    let value = (src as *const u16).read_unaligned();
+                    match type_ {
+                        gles11::UNSIGNED_SHORT_5_6_5 => (
+                            ((((value >> 11) & 0x1f) as u32 * 255 / 31) as u8),
+                            ((((value >> 5) & 0x3f) as u32 * 255 / 63) as u8),
+                            (((value & 0x1f) as u32 * 255 / 31) as u8),
+                            255,
+                        ),
+                        gles11::UNSIGNED_SHORT_4_4_4_4 => (
+                            ((((value >> 12) & 0xf) as u8) * 17),
+                            ((((value >> 8) & 0xf) as u8) * 17),
+                            ((((value >> 4) & 0xf) as u8) * 17),
+                            (((value & 0xf) as u8) * 17),
+                        ),
+                        _ => (
+                            ((((value >> 11) & 0x1f) as u32 * 255 / 31) as u8),
+                            ((((value >> 6) & 0x1f) as u32 * 255 / 31) as u8),
+                            ((((value >> 1) & 0x1f) as u32 * 255 / 31) as u8),
+                            if value & 1 == 0 { 0 } else { 255 },
+                        ),
+                    }
+                }
+                _ => return None,
+            };
+            std::slice::from_raw_parts_mut(dst, 4).copy_from_slice(&[r, g, b, a]);
+        }
+    }
+    Some(output)
 }
 
 pub struct PalettedTextureFormat {
@@ -274,6 +581,91 @@ pub struct PalettedTextureFormat {
     pub palette_entry_type: GLenum,
 }
 impl PalettedTextureFormat {
+    pub fn decode_rgba8(
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let info = Self::get_info(internalformat)?;
+        let width = usize::try_from(width).ok()?;
+        let height = usize::try_from(height).ok()?;
+        let entry_size = match info.palette_entry_type {
+            gles11::UNSIGNED_BYTE => {
+                if info.palette_entry_format == gles11::RGB {
+                    3
+                } else {
+                    4
+                }
+            }
+            gles11::UNSIGNED_SHORT_5_6_5
+            | gles11::UNSIGNED_SHORT_4_4_4_4
+            | gles11::UNSIGNED_SHORT_5_5_5_1 => 2,
+            _ => return None,
+        };
+        let palette_count: usize = if info.index_is_nibble { 16 } else { 256 };
+        let palette_size = palette_count.checked_mul(entry_size)?;
+        let pixel_count = width.checked_mul(height)?;
+        let index_size = if info.index_is_nibble {
+            pixel_count.checked_add(1)? / 2
+        } else {
+            pixel_count
+        };
+        let total_size = palette_size.checked_add(index_size)?;
+        if payload.len() < total_size {
+            return None;
+        }
+        let (palette, indices) = payload.split_at(palette_size);
+        let mut output = Vec::with_capacity(pixel_count.checked_mul(4)?);
+        for pixel in 0..pixel_count {
+            let index = if info.index_is_nibble {
+                let byte = indices[pixel / 2];
+                if pixel % 2 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xf
+                }
+            } else {
+                indices[pixel]
+            } as usize;
+            let entry = &palette[index * entry_size..][..entry_size];
+            let (r, g, b, a) = match info.palette_entry_type {
+                gles11::UNSIGNED_BYTE if entry_size == 3 => (entry[0], entry[1], entry[2], 255),
+                gles11::UNSIGNED_BYTE => (entry[0], entry[1], entry[2], entry[3]),
+                gles11::UNSIGNED_SHORT_5_6_5 => {
+                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
+                    (
+                        (((value >> 11) & 31) as u32 * 255 / 31) as u8,
+                        (((value >> 5) & 63) as u32 * 255 / 63) as u8,
+                        ((value & 31) as u32 * 255 / 31) as u8,
+                        255,
+                    )
+                }
+                gles11::UNSIGNED_SHORT_4_4_4_4 => {
+                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
+                    (
+                        (((value >> 12) & 15) as u8) * 17,
+                        (((value >> 8) & 15) as u8) * 17,
+                        (((value >> 4) & 15) as u8) * 17,
+                        ((value & 15) as u8) * 17,
+                    )
+                }
+                gles11::UNSIGNED_SHORT_5_5_5_1 => {
+                    let value = u16::from_ne_bytes([entry[0], entry[1]]);
+                    (
+                        (((value >> 11) & 31) as u32 * 255 / 31) as u8,
+                        (((value >> 6) & 31) as u32 * 255 / 31) as u8,
+                        (((value >> 1) & 31) as u32 * 255 / 31) as u8,
+                        if value & 1 == 0 { 0 } else { 255 },
+                    )
+                }
+                _ => return None,
+            };
+            output.extend_from_slice(&[r, g, b, a]);
+        }
+        Some(output)
+    }
+
     /// If the provided format is from `OES_compressed_paletted_texture`,
     /// return [Some] with information about it, or [None] otherwise.
     pub fn get_info(internalformat: GLenum) -> Option<Self> {

@@ -16,10 +16,9 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio::openal::OpenALManager;
 use crate::cpu::Cpu;
 use crate::libc::semaphore::sem_t;
-use crate::mem::{GuestUSize, MutPtr, MutVoidPtr};
+use crate::mem::{self, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::{
-    abi, bundle, cpu, dyld, frameworks, fs, gdb, image, libc, mach_o, mem, objc, options, stack,
-    window,
+    abi, bundle, cpu, dyld, frameworks, fs, gdb, image, libc, mach_o, objc, options, stack, window,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -44,9 +43,11 @@ pub type HostContext = Coroutine<Environment, Environment, Environment>;
 /// (~16 KiB of host frames each) — the recursion guard in
 /// `objc_msgSend_inner` allows 128, so a deeply recursing app would overflow
 /// the stack into its guard page (SIGBUS) before the guard could bail out.
-/// The memory is mapped lazily, so the cost of the extra headroom is virtual
-/// address space, not RAM.
-const HOST_STACK_SIZE: usize = 8 * 1024 * 1024;
+/// 16 MiB also covers deeply-nested guest -> host -> JNI calls on Android,
+/// where ART's CheckJNI aborts with a pending StackOverflowError (SIGABRT) at
+/// smaller sizes. The memory is mapped lazily, so the cost of the extra
+/// headroom is virtual address space, not RAM.
+const HOST_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// [Coroutine::new], but with [HOST_STACK_SIZE] instead of the default 1 MiB.
 fn coroutine_with_big_stack<F>(func: F) -> HostContext
@@ -105,11 +106,27 @@ impl std::fmt::Debug for Thread {
     }
 }
 
+/// Last guest PC seen by the CPU loop, for crash diagnostics.
+pub static LAST_GUEST_PC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Last guest LR seen by the CPU loop, for crash diagnostics.
+pub static LAST_GUEST_LR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Ring buffer of the last N guest PCs, for crash diagnostics.
+pub static GUEST_PC_RING: [std::sync::atomic::AtomicU32; 32] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    [ZERO; 32]
+};
+pub static GUEST_PC_RING_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The struct containing the entire emulator state. Methods are provided for
 /// execution and management of threads.
 pub struct Environment {
     /// Reference point for various timing functions.
     pub startup_time: Instant,
+    pub(crate) guest_clock: crate::guest_clock::GuestClock,
     pub bundle: NullableBox<bundle::Bundle>,
     pub fs: NullableBox<fs::Fs>,
     /// The window is only absent when running in headless mode.
@@ -141,6 +158,34 @@ pub struct Environment {
     /// Tracks repeated UndefinedInstruction bypasses. See `debug_cpu_error`.
     udf_bypass_last: Option<(u32, u32)>,
     udf_bypass_count: u32,
+    /// Tracks consecutive UndefinedInstruction bypasses that all fake-return
+    /// to the *same* LR, regardless of the faulting PC. This catches runaway
+    /// loops where the faulting PC alternates between several bogus addresses
+    /// (so the `(pc, lr)` key above keeps resetting) but the guest keeps
+    /// bouncing back to a single return site — e.g. a game that called
+    /// through a nil/garbage function pointer. See `debug_cpu_error`.
+    udf_bypass_last_lr: Option<u32>,
+    udf_bypass_lr_count: u32,
+    /// A guest `exit`/`abort` had no safe frame to recover to. This is consumed
+    /// at the existing return-to-host boundary so it cannot terminate the host
+    /// process from inside a linked libc function.
+    guest_termination_requested: bool,
+    /// A required Unity player archive could not be resolved or read from the
+    /// mounted bundle. Continuing after Unity calls its fatal exit would
+    /// execute a half-initialized engine, so termination recovery is disabled
+    /// for this guest session.
+    missing_unity_player_archive: Option<String>,
+    /// A linked host function deliberately redirected the guest PC. This skips
+    /// the normal post-SVC return, which would overwrite the new continuation
+    /// for compact four-byte stubs.
+    guest_control_flow_redirected: bool,
+    /// Synthetic guest frames installed by `GuestFunction::call_from_host`.
+    /// They are host-call boundaries, not safe recovery targets.
+    host_to_guest_stack_frames: Vec<(usize, u32)>,
+    /// Optional RTCV-style game-corruption engine. Always present, but only
+    /// does anything when enabled via the `--corrupt*` options.
+    corruptor: crate::corrupt::Corruptor,
+    trainer: crate::trainer::Trainer,
 }
 
 /// What to do next when executing this thread.
@@ -160,6 +205,8 @@ pub enum ThreadBlock {
     NotBlocked,
     // Thread is sleeping. (until Instant)
     Sleeping(Instant),
+    // Guest deadline, rescaled dynamically by the game clock.
+    GuestSleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
     // Thread is waiting on a semaphore.
@@ -485,6 +532,27 @@ impl Environment {
         log!("{:?} device family is chosen.", device_family);
         options.device_family = Some(device_family);
 
+        // Read the executable before the window exists: which OpenGL ES API
+        // generation the app can use decides which host GL driver the window
+        // should load on Android (see `Window::new`). The same bytes are
+        // parsed into guest memory further down, so the file is read once.
+        let executable_path = bundle.executable_path();
+        let executable_name = executable_path.file_name().unwrap().to_string();
+        let executable_bytes = fs
+            .read(executable_path)
+            .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
+        let gles_api_usage = mach_o::scan_gles_api_usage(&executable_bytes);
+        log!(
+            "Executable imports OpenGL ES entry points: ES 1.1 fixed-function: {}, ES 2.0 shaders: {}{}",
+            if gles_api_usage.uses_es1 { "yes" } else { "no" },
+            if gles_api_usage.uses_es2 { "yes" } else { "no" },
+            if gles_api_usage.is_es2_only() {
+                " (OpenGL ES 2.0-only app)"
+            } else {
+                ""
+            }
+        );
+
         let window = if options.headless {
             None
         } else {
@@ -524,6 +592,7 @@ impl Environment {
                 icon.ok(),
                 launch_image.map(|image| (image, false)),
                 &options,
+                Some(gles_api_usage),
             )))
         };
 
@@ -546,13 +615,14 @@ impl Environment {
             // the game crashes with a null page access error.
             log!("Applying game-specific hack for Critter Crunch: zeroing memory on alloc instead of free.");
         }
-        let executable = mach_o::MachO::load_from_file(
-            bundle.executable_path(),
-            &fs,
+        let executable = mach_o::MachO::load_from_bytes(
+            &executable_bytes,
             &mut mem,
+            executable_name,
             /* slide: */ 0,
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
+        drop(executable_bytes);
 
         let mut dylibs = Vec::new();
         let mut pending_dylibs: VecDeque<String> =
@@ -618,6 +688,11 @@ impl Environment {
             } else if !crate::dyld::DYLIB_LIST
                 .iter()
                 .any(|d| d.path == dylib.as_str() || d.aliases.contains(&dylib.as_str()))
+                // The Swift runtime dylibs are provided host-side by
+                // `dyld::swift_runtime` (all `__swift_*` entry points, type
+                // metadata slots and `__swift_FORCE_LOAD_$_*` autolink
+                // shims), so listing them here would be pure noise.
+                && !dylib.rsplit('/').next().unwrap_or(&dylib).starts_with("libswift")
             {
                 log!(
                     "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
@@ -679,14 +754,19 @@ impl Environment {
                         if processed.contains(&class) {
                             continue;
                         }
-                        if env.objc.is_unimplemented_class(class) || env.objc.is_fake_class(class) {
+                        if env.objc.is_unimplemented_class(class)
+                            || env.objc.is_fake_class(class)
+                        {
                             continue;
                         }
                         if env
                             .objc
                             .object_has_uninherited_method(&env.mem, class, load_sel)
                         {
-                            log_dbg!("Calling +load on inheritance chain of {} class", class_name);
+                            log_dbg!(
+                                "Calling +load on inheritance chain of {} class",
+                                class_name
+                            );
                             let mut inherited = Vec::new();
                             let mut curr_class = class;
                             while curr_class != objc::nil
@@ -763,7 +843,8 @@ impl Environment {
                         let envp_ref_list: Vec<&str> =
                             envp_list.iter().map(|keyvalue| keyvalue.as_str()).collect();
 
-                        let bin_path_apple_key = format!("executable_path={}", bin_path.as_str());
+                        let bin_path_apple_key =
+                            format!("executable_path={}", bin_path.as_str());
 
                         let argv = Vec::from_iter(
                             std::iter::once(bin_path.as_str())
@@ -789,7 +870,13 @@ impl Environment {
 
                     env.run_call();
 
-                    panic!("Main function exited unexpectedly!");
+                    if env.guest_termination_requested {
+                        echo!(
+                            "Guest requested controlled termination; returning to the host."
+                        );
+                    } else {
+                        panic!("Main function exited unexpectedly!");
+                    }
                 })
             }));
 
@@ -813,6 +900,7 @@ impl Environment {
 
         let mut env = Environment {
             startup_time,
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::new(bundle),
             fs: NullableBox::new(fs),
             window,
@@ -837,7 +925,30 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_last_lr: None,
+            udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            missing_unity_player_archive: None,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
+            corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         };
+
+        env.trainer = crate::trainer::Trainer::new(!env.options.trainer_disabled);
+        env.corruptor = crate::corrupt::Corruptor::new(env.options.corruption.clone());
+        if env.corruptor.is_enabled() {
+            log!(
+                "[corrupt] RTCV-style game corruption ENABLED: every {} frame(s), {} byte(s) per burst, seed {:#x}{}",
+                env.options.corruption.interval_frames.max(1),
+                env.options.corruption.bytes_per_burst.max(1),
+                env.options.corruption.seed,
+                match env.options.corruption.max_offset {
+                    Some(o) => format!(", max offset {}", o),
+                    None => String::new(),
+                }
+            );
+        }
 
         if env.options.dumping_options.any() {
             env.dump_file =
@@ -925,6 +1036,7 @@ impl Environment {
             Some(icon),
             launch_image,
             &options,
+            None,
         )));
 
         let mut mem = mem::Mem::new();
@@ -954,6 +1066,7 @@ impl Environment {
 
         let mut env = Environment {
             startup_time,
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::new(bundle),
             fs: NullableBox::new(fs),
             window,
@@ -978,6 +1091,14 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_last_lr: None,
+            udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            missing_unity_player_archive: None,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
+            corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         };
 
         env.set_up_initial_env_vars();
@@ -1016,6 +1137,7 @@ impl Environment {
     unsafe fn new_fake() -> Self {
         Self {
             startup_time: Instant::now(),
+            guest_clock: crate::guest_clock::GuestClock::new(),
             bundle: NullableBox::null(),
             fs: NullableBox::null(),
             window: None,
@@ -1040,6 +1162,14 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_last_lr: None,
+            udf_bypass_lr_count: 0,
+            guest_termination_requested: false,
+            missing_unity_player_archive: None,
+            guest_control_flow_redirected: false,
+            host_to_guest_stack_frames: Vec::new(),
+            corruptor: crate::corrupt::Corruptor::default(),
+            trainer: crate::trainer::Trainer::new(false),
         }
     }
 
@@ -1207,15 +1337,30 @@ impl Environment {
         } else {
             echo_no_panic!(" 1. {:#x} (LR)", lr);
         }
+        // A corrupted guest frame chain used to make diagnostics loop forever
+        // before a recovery path could reject it. Keep stack traces
+        // best-effort: only read complete, aligned records inside the current
+        // thread's stack; require older frames to be higher on ARM's
+        // descending stack; and bound the walk even if guest memory cycles.
+        const MAX_STACK_TRACE_FRAMES: usize = 64;
         let mut i = 2;
-        let mut fp: mem::ConstPtr<u8> = mem::Ptr::from_bits(regs[abi::FRAME_POINTER]);
-        loop {
-            if !stack_range.contains(&fp.to_bits()) {
-                echo_no_panic!("Next FP ({:?}) is outside the stack.", fp);
+        let mut fp = regs[abi::FRAME_POINTER];
+        for _ in 0..MAX_STACK_TRACE_FRAMES {
+            if fp == 0 || !fp.is_multiple_of(4) {
+                echo_no_panic!("Next FP ({:#x}) is null or unaligned.", fp);
                 break;
             }
-            lr = self.mem.read((fp + 4).cast());
-            fp = self.mem.read(fp.cast());
+            let Some(saved_lr_addr) = fp.checked_add(4) else {
+                echo_no_panic!("Next FP ({:#x}) overflows its frame record.", fp);
+                break;
+            };
+            if !stack_range.contains(&fp) || !stack_range.contains(&saved_lr_addr) {
+                echo_no_panic!("Next FP ({:#x}) is outside the stack.", fp);
+                break;
+            }
+
+            lr = self.mem.read(mem::ConstPtr::<u32>::from_bits(saved_lr_addr));
+            let previous_fp: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp));
             if lr == return_to_host_routine_addr {
                 echo_no_panic!("{:2}. [host function]", i);
             } else if lr == thread_exit_routine_addr {
@@ -1224,6 +1369,19 @@ impl Environment {
             } else {
                 echo_no_panic!("{:2}. {:#x}", i, lr);
             }
+
+            if previous_fp == 0 {
+                echo_no_panic!("Next FP is null.");
+                break;
+            }
+            if previous_fp <= fp || !previous_fp.is_multiple_of(4) {
+                echo_no_panic!(
+                    "Next FP ({:#x}) does not advance toward an older frame.",
+                    previous_fp
+                );
+                break;
+            }
+            fp = previous_fp;
             i += 1;
         }
     }
@@ -1242,6 +1400,10 @@ impl Environment {
         assert!(stack_high_addr.is_multiple_of(4));
 
         let thread_routine = coroutine_with_big_stack(move |yielder, mut env| {
+            log_dbg!(
+                "touchHLE: guest worker thread now running (start_routine={:#x})",
+                start_routine.addr_with_thumb_bit()
+            );
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 env.with_yielder(yielder, move |env| {
                     let regs = env.cpu.regs_mut();
@@ -1258,7 +1420,7 @@ impl Environment {
                     let curr_thread = &mut env.threads[env.current_thread];
                     curr_thread.return_value = Some(return_value);
                     curr_thread.active = false;
-                });
+                })
             }));
             if let Err(e) = res {
                 let panic_cell = env.panic_cell.clone();
@@ -1302,6 +1464,13 @@ impl Environment {
         );
         let until = Instant::now().checked_add(duration).unwrap();
         self.yield_thread(ThreadBlock::Sleeping(until));
+    }
+
+    /// Guest-requested sleep. Keep its deadline in game time so changing
+    /// speed also affects waits already in progress. Host pacing uses sleep().
+    pub fn sleep_guest(&mut self, duration: Duration) {
+        let until = self.guest_clock.now().checked_add(duration).unwrap();
+        self.yield_thread(ThreadBlock::GuestSleeping(until));
     }
 
     #[allow(dead_code)]
@@ -1379,12 +1548,19 @@ impl Environment {
     /// execution of the current host thread (if the semaphore is
     /// currently at 0).
     pub fn sem_decrement(&mut self, sem: MutPtr<sem_t>, wait_on_lock: bool) -> bool {
-        let host_sem_rc: &mut _ = self
-            .libc_state
-            .semaphore
-            .open_semaphores
-            .get_mut(&sem)
-            .unwrap();
+        let Some(host_sem_rc) = self.libc_state.semaphore.open_semaphores.get_mut(&sem) else {
+            // The guest called sem_wait/sem_trywait on an uninitialised or
+            // already-destroyed semaphore. POSIX/Apple document this as an
+            // `EINVAL` failure of the wait, so we report failure to the caller
+            // (which sets errno) instead of aborting the whole process.
+            log!(
+                "Warning: sem_decrement called on unknown semaphore {:?}; \
+                 failing without blocking (guest likely waited on an \
+                 uninitialised or destroyed semaphore).",
+                sem
+            );
+            return false;
+        };
         let mut host_sem = (*host_sem_rc).borrow_mut();
 
         if host_sem.value > 0 {
@@ -1417,13 +1593,23 @@ impl Environment {
     }
 
     /// Unlock a semaphore (increments value of a semaphore).
-    pub fn sem_increment(&mut self, sem: MutPtr<sem_t>) {
-        let host_sem_rc: &mut _ = self
-            .libc_state
-            .semaphore
-            .open_semaphores
-            .get_mut(&sem)
-            .unwrap();
+    ///
+    /// Returns `true` if the semaphore was known and incremented, `false` if
+    /// the pointer does not refer to a semaphore this environment is tracking.
+    /// A guest may legitimately hit the latter case by calling `sem_post` on an
+    /// uninitialised or already-destroyed semaphore; POSIX/Apple document this
+    /// as an `EINVAL` failure of `sem_post`, not a reason to abort the whole
+    /// process, so callers translate the `false` return into that errno instead
+    /// of panicking.
+    pub fn sem_increment(&mut self, sem: MutPtr<sem_t>) -> bool {
+        let Some(host_sem_rc) = self.libc_state.semaphore.open_semaphores.get_mut(&sem) else {
+            log!(
+                "Warning: sem_increment called on unknown semaphore {:?}; \
+                 ignoring (guest likely posted an uninitialised or destroyed semaphore).",
+                sem
+            );
+            return false;
+        };
         let mut host_sem = (*host_sem_rc).borrow_mut();
 
         host_sem.value += 1;
@@ -1432,6 +1618,7 @@ impl Environment {
             sem,
             host_sem.value
         );
+        true
     }
 
     /// Blocks the current thread until the thread given finishes, writing its
@@ -1493,16 +1680,25 @@ impl Environment {
                     std::panic::resume_unwind(e);
                 }
             };
-            self.window
-                .as_mut()
-                .unwrap()
-                .poll_for_events(self.options.as_ref());
+            // As with the main app run loop, poll for events with SDL treating
+            // the current stack as the main stack; without this, event polling
+            // would be skipped for the rest of the picker session as soon as
+            // anything calls on_parent_stack_in_coroutine().
+            {
+                let window = self.window.as_mut().unwrap();
+                window.on_main_stack = true;
+                window.poll_for_events(self.options.as_ref());
+            }
             assert!(self.threads.len() == 1);
             match self.threads[0].blocked_by {
                 ThreadBlock::NotBlocked => {}
                 ThreadBlock::Sleeping(until) => {
                     let duration = until.duration_since(Instant::now());
                     std::thread::sleep(duration);
+                }
+                ThreadBlock::GuestSleeping(until) => {
+                    let due = self.guest_clock.host_deadline(until);
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
                 }
                 ref other => {
                     log!(
@@ -1534,11 +1730,71 @@ impl Environment {
             if stepping {
                 self.remaining_ticks = None;
             } else {
-                // 100,000 ticks is an arbitrary number. It needs to be
+                // 1,000,000 ticks is an arbitrary number. It needs to be
                 // reasonably large so we aren't jumping in and out of dynarmic
                 // or trying to poll for events too often. At the same time,
                 // very large values are bad for responsiveness.
-                self.remaining_ticks = Some(100_000);
+                //
+                // PERF: raised from 100,000 to 1,000,000: the per-batch costs
+                // (leaving/re-entering the JIT, coroutine switch, scheduler
+                // pass and one event-poll attempt) are amortised 10x better.
+                // This is responsiveness-safe because:
+                // - OS event polling has its own throttle in
+                //   Window::poll_for_events (roughly 120 Hz), independent of
+                //   batch size;
+                // - sleeping guest threads use absolute host deadlines, so the
+                //   scheduler still wakes them on time between batches;
+                // - in practice most batches end early anyway, when the guest
+                //   calls a host framework function (which happens many times
+                //   per frame: present, timers, audio, input, etc.), so the
+                //   larger cap mostly helps busy guest spin-loops, which is
+                //   exactly where the per-batch overhead used to matter.
+                //
+                // FRAME PACING: a thread still has to finish its current batch
+                // before the scheduler gets to wake any *sleeping* thread
+                // whose deadline arrived in the meantime, so with the large
+                // batch a pacing/timer/audio wake-up could land up to one
+                // batch (~a few ms at ~1M ticks) late. To keep
+                // millisecond-accurate deadlines (frame pacing, run-loop
+                // timers, audio callbacks) precise while retaining the
+                // overhead win in long busy stretches, fall back to the
+                // smaller batch whenever any thread has an imminent wake-up.
+                let imminent_wakeup = self.threads.iter().any(|thread| {
+                    let deadline = match thread.blocked_by {
+                        ThreadBlock::Sleeping(due) => Some(due),
+                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
+                        _ => None,
+                    };
+                    deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
+                });
+                self.remaining_ticks = Some(if imminent_wakeup {
+                    100_000
+                } else {
+                    1_000_000
+                });
+            }
+            // RTCV-style game corruption: once per main-loop iteration, give the
+            // corruption engine a chance to mangle live guest memory. This is a
+            // no-op unless enabled via the `--corrupt*` options.
+            if self.corruptor.is_enabled() {
+                let mut corruptor = std::mem::take(&mut self.corruptor);
+                corruptor.tick(&mut self.mem);
+                self.corruptor = corruptor;
+            }
+            // Game trainer (Cheat Engine-style memory search/patch + on-screen
+            // UI). No-op unless enabled (default on for games).
+            {
+                let app_id = self.bundle.bundle_identifier().to_string();
+                let mut trainer = std::mem::replace(
+                    &mut self.trainer,
+                    crate::trainer::Trainer::new(false),
+                );
+                trainer.tick(&mut self.mem, Some(app_id.as_str()), &self.objc);
+                self.trainer = trainer;
+                if let Some(speed) = crate::trainer_ui::take_speed_request() {
+                    self.guest_clock.set_speed(speed);
+                    crate::trainer_ui::publish_status(format!("GAME SPEED {}", speed.label()));
+                }
             }
             let mut kill_current_thread = false;
             if let Some(w) = self.window.as_mut() {
@@ -1597,6 +1853,7 @@ impl Environment {
                     std::process::exit(-1)
                 };
                 self = env;
+                self.threads[self.current_thread].active = false;
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
@@ -1607,6 +1864,20 @@ impl Environment {
             };
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
+            }
+
+            if kill_current_thread && self.guest_termination_requested {
+                echo!("Guest session ended through the controlled return-to-host path.");
+                return;
+            }
+            if self.guest_termination_requested {
+                // A host callback may have yielded before its linked-function
+                // dispatch reached the return-to-host check. Put this live
+                // context back so `Environment::drop` can unwind it safely,
+                // then stop before the scheduler resumes another guest thread.
+                self.threads[self.current_thread].host_context = old_context.take();
+                echo!("Guest session ended while returning from a host callback.");
+                return;
             }
 
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1716,6 +1987,93 @@ impl Environment {
             }
             curr_host_context = old_context.unwrap();
         }
+    }
+
+    /// Request that active guest execution returns through its host boundary.
+    ///
+    /// Linked libc functions use this when an `exit`/`abort` cannot be safely
+    /// unwound. The request is observed by the CPU loop after the host function
+    /// returns, so no guest instruction after a `noreturn` call is executed.
+    pub(crate) fn request_guest_termination(&mut self) {
+        self.guest_termination_requested = true;
+    }
+
+    /// Whether a linked guest termination function has requested session end.
+    pub(crate) fn is_guest_termination_requested(&self) -> bool {
+        self.guest_termination_requested
+    }
+
+    /// Remember that Unity's mandatory serialized player archive is unavailable.
+    ///
+    /// This records both a missing VFS node and an unreadable/empty archive
+    /// entry. The archive is not optional: once Unity has reported this failure
+    /// it calls `exit(1)` after partially initializing global state. Treating
+    /// that exit as a recoverable DRM-style exit leads to use-after-null and
+    /// bogus multi-gigabyte allocations, as the engine's cleanup path was not
+    /// designed to return to the app.
+    pub(crate) fn note_missing_unity_player_archive(&mut self, path: &str) {
+        let is_player_archive = path.rsplit_once('/').is_some_and(|(parent, file)| {
+            file.eq_ignore_ascii_case("data.unity3d")
+                && parent
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|component| component.eq_ignore_ascii_case("Data"))
+        });
+        if !is_player_archive || self.missing_unity_player_archive.is_some() {
+            return;
+        }
+
+        self.missing_unity_player_archive = Some(path.to_owned());
+        log!(
+            "Required Unity player archive {:?} is unavailable from the mounted \
+             bundle. A following guest termination will return to the host instead \
+             of resuming a \
+             half-initialized Unity engine.",
+            path
+        );
+    }
+
+    /// The unavailable Unity player archive, if a resource probe found one.
+    pub(crate) fn missing_unity_player_archive(&self) -> Option<&str> {
+        self.missing_unity_player_archive.as_deref()
+    }
+
+    /// Preserve a deliberate guest-PC redirect across linked-stub dispatch.
+    pub(crate) fn note_guest_control_flow_redirect(&mut self) {
+        self.guest_control_flow_redirected = true;
+    }
+
+    /// Mark a synthetic frame installed for a host-to-guest call.
+    pub(crate) fn push_host_to_guest_stack_frame(
+        &mut self,
+        frame_pointer: u32,
+    ) -> (ThreadId, u32) {
+        let frame = (self.current_thread, frame_pointer);
+        self.host_to_guest_stack_frames.push(frame);
+        frame
+    }
+
+    /// Remove a synthetic frame after its host-to-guest call has returned.
+    pub(crate) fn pop_host_to_guest_stack_frame(&mut self, frame: (ThreadId, u32)) {
+        if let Some(index) = self
+            .host_to_guest_stack_frames
+            .iter()
+            .rposition(|&candidate| candidate == frame)
+        {
+            self.host_to_guest_stack_frames.remove(index);
+        } else {
+            log_no_panic!(
+                "Warning: synthetic host-to-guest frame {:?} was not tracked.",
+                frame
+            );
+        }
+    }
+
+    /// Whether the current frame is a synthetic host-to-guest call boundary.
+    pub(crate) fn is_host_to_guest_stack_frame(&self, frame_pointer: u32) -> bool {
+        self.host_to_guest_stack_frames
+            .iter()
+            .any(|&(thread, fp)| thread == self.current_thread && fp == frame_pointer)
     }
 
     /// Run the emulator until the app returns control to the host. This is for
@@ -1977,6 +2335,47 @@ impl Environment {
                     1
                 };
 
+                // Independently track how many times in a row we've faked a
+                // return to the SAME LR, ignoring the faulting PC. The `(pc,
+                // lr)` counter above resets to 1 whenever the faulting PC
+                // changes, so a guest that keeps calling through a bad/nil
+                // function pointer from a single call site — trapping at a
+                // handful of *different* garbage addresses but always
+                // returning to the same LR — never trips `BYPASS_LIMIT` and
+                // the emulator wedges forever.
+                //
+                // This is exactly the Rush Rally 2 startup hang: the faulting
+                // PC alternates between 0x4000 and 0x36c6ec30 while LR stays
+                // 0x2639a3, so the pair counter oscillates around 1 and the
+                // process spins until it's killed. Bounding the number of
+                // consecutive same-LR fake returns turns that infinite hang
+                // into a clean, actionable panic. We allow a larger budget
+                // here than `BYPASS_LIMIT` so genuinely recoverable cases
+                // (which do make forward progress and eventually settle on a
+                // stable LR) are unaffected.
+                const LR_BYPASS_LIMIT: u32 = 4096;
+                let lr_count = if self.udf_bypass_last_lr == Some(lr) {
+                    self.udf_bypass_lr_count = self.udf_bypass_lr_count.saturating_add(1);
+                    self.udf_bypass_lr_count
+                } else {
+                    self.udf_bypass_last_lr = Some(lr);
+                    self.udf_bypass_lr_count = 1;
+                    1
+                };
+
+                if lr_count >= LR_BYPASS_LIMIT {
+                    panic!(
+                        "UndefinedInstruction bypass faked a return to LR={:#x} \
+                         {} times in a row (most recent faulting PC {:#x}); \
+                         giving up to avoid hanging. The guest is repeatedly \
+                         calling through a bad/nil function pointer from a \
+                         single call site — usually a framework stub that \
+                         returned a bogus object the game then dereferences \
+                         as a function.",
+                        lr, lr_count, pc
+                    );
+                }
+
                 if count == 1 || count % LOG_RATE == 0 {
                     log_no_panic!(
                         "Warning: Ignored UndefinedInstruction at {:#x}. \
@@ -1994,13 +2393,36 @@ impl Environment {
                 }
 
                 if count >= BYPASS_LIMIT {
-                    panic!(
-                        "UndefinedInstruction at {:#x} looped {} times with \
-                         LR={:#x}; giving up to avoid hanging. This usually \
-                         means a framework stub returned bogus data that the \
-                         guest keeps re-trapping on.",
-                        pc, count, lr
-                    );
+                    // The same (PC, LR) pair has trapped BYPASS_LIMIT times.
+                    // Faking a return to LR clearly does not help — the caller
+                    // keeps re-entering the faulting site (usually a framework
+                    // stub that returned bogus data the guest re-calls into).
+                    // Rather than killing the whole emulator, degrade
+                    // gracefully: skip past the faulting instruction (treat
+                    // the UDF as a no-op) so execution continues in the
+                    // caller's body, and reset the counters so a later,
+                    // different loop still gets a fresh budget. A genuine
+                    // infinite hang is still bounded by LR_BYPASS_LIMIT
+                    // above and by the per-batch forward-progress reset in
+                    // `handle_cpu_state`.
+                    if count == BYPASS_LIMIT || count % (BYPASS_LIMIT * 4) == 0 {
+                        log_no_panic!(
+                            "Warning: UndefinedInstruction at {:#x} looped {} \
+                             times with LR={:#x}. Faking returns is not making \
+                             progress, so skipping the faulting instruction \
+                             instead. This usually means a framework stub \
+                             returned data the guest keeps re-trapping on.",
+                            pc,
+                            count,
+                            lr
+                        );
+                    }
+                    self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
+                    self.udf_bypass_last = None;
+                    self.udf_bypass_count = 0;
+                    self.udf_bypass_last_lr = None;
+                    self.udf_bypass_lr_count = 0;
+                    return;
                 }
 
                 // Pathological self-loop: when LR (with Thumb bit cleared)
@@ -2023,6 +2445,8 @@ impl Environment {
                     self.cpu.regs_mut()[cpu::Cpu::PC] = pc.wrapping_add(instruction_len);
                     self.udf_bypass_last = None;
                     self.udf_bypass_count = 0;
+                    self.udf_bypass_last_lr = None;
+                    self.udf_bypass_lr_count = 0;
                     return;
                 }
 
@@ -2064,7 +2488,18 @@ impl Environment {
     /// debugging) and decide what to do next.
     fn handle_cpu_state(&mut self, state: cpu::CpuState) -> ThreadNextAction {
         match state {
-            cpu::CpuState::Normal => ThreadNextAction::Continue,
+            cpu::CpuState::Normal => {
+                // The CPU executed a full batch of instructions without
+                // trapping: real forward progress. Clear the same-LR bypass
+                // runaway counter so an earlier, since-recovered burst of
+                // fake returns can't accumulate toward a false-positive
+                // panic. (The genuine runaway loop never reaches this state:
+                // it produces back-to-back UndefinedInstruction errors with
+                // no Normal batch in between.)
+                self.udf_bypass_last_lr = None;
+                self.udf_bypass_lr_count = 0;
+                ThreadNextAction::Continue
+            }
             cpu::CpuState::Svc(svc) => {
                 // The program counter is pointing at the
                 // instruction after the SVC, but we want the
@@ -2088,7 +2523,30 @@ impl Environment {
                             svc_pc,
                             svc,
                         ) {
+                            // Successfully dispatching a host/linked function
+                            // is real forward progress, so clear the same-LR
+                            // bypass runaway counter (see `debug_cpu_error`).
+                            self.udf_bypass_last_lr = None;
+                            self.udf_bypass_lr_count = 0;
                             f.call_from_guest(self);
+
+                            let guest_control_flow_redirected =
+                                std::mem::take(&mut self.guest_control_flow_redirected);
+                            if self.guest_termination_requested {
+                                log_dbg!(
+                                    "Guest termination requested on thread {}; \
+                                     returning through the host boundary.",
+                                    self.current_thread
+                                );
+                                return ThreadNextAction::ReturnToHost;
+                            }
+                            if guest_control_flow_redirected {
+                                log_dbg!(
+                                    "Linked host function redirected guest control flow; \
+                                     skipping normal stub return."
+                                );
+                                return ThreadNextAction::Continue;
+                            }
 
                             // ORIGINAL LOGIC MERGED: Stack zeroing
                             if svc & dyld::Dyld::SVC_LAZY_LINK_RET_FLAG == 0 {
@@ -2169,6 +2627,13 @@ impl Environment {
             );
             return;
         }
+        if self.guest_termination_requested {
+            log_dbg!(
+                "Guest termination is pending on thread {}; returning to host.",
+                initial_thread
+            );
+            return;
+        }
 
         loop {
             while self
@@ -2178,6 +2643,155 @@ impl Environment {
                 let state = self
                     .cpu
                     .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
+                let diag_pc = self.cpu.regs()[crate::cpu::Cpu::PC];
+                std::sync::atomic::AtomicU32::store(
+                    &crate::environment::LAST_GUEST_PC,
+                    diag_pc,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::sync::atomic::AtomicU32::store(
+                    &crate::environment::LAST_GUEST_LR,
+                    self.cpu.regs()[crate::cpu::Cpu::LR],
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let ring_i = std::sync::atomic::AtomicUsize::load(
+                    &crate::environment::GUEST_PC_RING_IDX,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::sync::atomic::AtomicU32::store(
+                    &crate::environment::GUEST_PC_RING[ring_i % 32],
+                    diag_pc,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::sync::atomic::AtomicUsize::store(
+                    &crate::environment::GUEST_PC_RING_IDX,
+                    ring_i.wrapping_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                // Asphalt 8 (com.gameloft.asphalt8) v1.1.0 compatibility hacks,
+                // ported from the touchHLE-XaView fork. The game deliberately
+                // calls abort() when its DRM/network checks fail, which looks
+                // like a silent emulator crash. These unwinds skip the checks.
+                if self
+                    .bundle
+                    .bundle_identifier()
+                    .starts_with("com.gameloft.asphalt8")
+                {
+                    let pc = self.cpu.regs()[Cpu::PC];
+                    // BypassAsphaltDRM: deep stack unwind past the license check
+                    if pc == 0x00600ac4 {
+                        log!(
+                            "WARNING: Bypassing Asphalt DRM via deep stack unwind at {:#010x}!",
+                            pc
+                        );
+                        let fp0 = self.cpu.regs()[7];
+                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
+                        let fp2: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
+                        let target_lr: GuestUSize =
+                            self.mem.read(mem::ConstPtr::from_bits(fp2 + 4));
+                        self.cpu.regs_mut()[7] = fp2;
+                        self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
+                        self.cpu.regs_mut()[0] = 0;
+                        self.cpu
+                            .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
+                    }
+                    // RestoreConditionalUnwinds: network module deadlocks
+                    if (pc == 0x00c3296c || pc == 0x00c32bfc) && self.current_thread != 0 {
+                        let fp0 = self.cpu.regs()[7];
+                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
+                        let target_lr: GuestUSize =
+                            self.mem.read(mem::ConstPtr::from_bits(fp0 + 4));
+                        let current_lr = self.cpu.regs()[Cpu::LR];
+                        if (current_lr & 0xFFFF0000) == 0x005b0000
+                            || (target_lr & 0xFFFF0000) == 0x005b0000
+                        {
+                            log!(
+                                "WARNING: Asphalt network deadlock safely unwound at {:#010x}! LR: {:#010x}",
+                                pc,
+                                target_lr
+                            );
+                            self.cpu.regs_mut()[7] = prev_fp;
+                            self.cpu.regs_mut()[Cpu::SP] = fp0 + 8;
+                            self.cpu.regs_mut()[0] = 0;
+                            self.cpu
+                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
+                        }
+                    } else if (pc == 0x00c3375c || pc == 0x00c3376c) && self.current_thread != 0 {
+                        let fp0 = self.cpu.regs()[7];
+                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
+                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
+                        let target_lr: GuestUSize =
+                            self.mem.read(mem::ConstPtr::from_bits(fp1 + 4));
+                        if (target_lr & 0xFFFF0000) == 0x005b0000 {
+                            log!(
+                                "WARNING: Asphalt deep unwind of infinite parser loop! LR: {:#010x}",
+                                target_lr
+                            );
+                            self.cpu.regs_mut()[7] = prev_fp;
+                            self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
+                            self.cpu.regs_mut()[0] = 0;
+                            self.cpu
+                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
+                        }
+                    } else if pc == 0x00c32b3c {
+                        // TargetedDoubleUnwind: smashed stack frame repair
+                        log!(
+                            "WARNING: Unwinding smashed Asphalt stack frame at {:#010x}! Thread: {}",
+                            pc,
+                            self.current_thread
+                        );
+                        let fp0 = self.cpu.regs()[7];
+                        let fp1: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
+                        if fp1 > fp0 && fp1.wrapping_sub(fp0) < 0x1000 {
+                            let saved_r4: GuestUSize =
+                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 12));
+                            let saved_r5: GuestUSize =
+                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 8));
+                            let saved_r6: GuestUSize =
+                                self.mem.read(mem::ConstPtr::from_bits(fp1 - 4));
+                            let saved_r7: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp1));
+                            let saved_lr: GuestUSize =
+                                self.mem.read(mem::ConstPtr::from_bits(fp1 + 4));
+                            self.cpu.regs_mut()[4] = saved_r4;
+                            self.cpu.regs_mut()[5] = saved_r5;
+                            self.cpu.regs_mut()[6] = saved_r6;
+                            self.cpu.regs_mut()[7] = saved_r7;
+                            self.cpu.regs_mut()[Cpu::SP] = fp1 + 8;
+                            self.cpu.regs_mut()[0] = 0;
+                            self.cpu
+                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(saved_lr | 1));
+                        } else {
+                            log!("FATAL: Asphalt stack chain corrupted beyond fp0!");
+                            self.cpu
+                                .branch(abi::GuestFunction::from_addr_with_thumb_bit(
+                                    0x00a8a1bd | 1,
+                                ));
+                        }
+                    }
+                    // BypassAsphaltOverdriveDeadlocks
+                    let lr = self.cpu.regs()[Cpu::LR];
+                    if (pc == 0x009d7784 && (lr == 0x0039418f || lr == 0x0039419b))
+                        || (pc == 0x009d7464 && lr == 0x0078df65)
+                        || (pc == 0x009d8334 && lr == 0x001722e1)
+                    {
+                        log!(
+                            "WARNING: Unwinding Asphalt Overdrive deadlock at PC: {:#010x}, LR: {:#010x}",
+                            pc,
+                            lr
+                        );
+                        let fp0 = self.cpu.regs()[7];
+                        let prev_fp: GuestUSize = self.mem.read(mem::ConstPtr::from_bits(fp0));
+                        let target_lr: GuestUSize =
+                            self.mem.read(mem::ConstPtr::from_bits(fp0 + 4));
+                        self.cpu.regs_mut()[7] = prev_fp;
+                        self.cpu.regs_mut()[Cpu::SP] = fp0 + 8;
+                        self.cpu.regs_mut()[0] = 0;
+                        self.cpu
+                            .branch(abi::GuestFunction::from_addr_with_thumb_bit(target_lr));
+                    }
+                }
+
                 match self.handle_cpu_state(state) {
                     ThreadNextAction::Continue => {}
                     ThreadNextAction::ReturnToHost => return,
@@ -2285,6 +2899,14 @@ impl Environment {
                             };
                         }
                     }
+                    ThreadBlock::GuestSleeping(due) => {
+                        if due <= self.guest_clock.now() {
+                            candidate.blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                        let host_due = self.guest_clock.host_deadline(due);
+                        next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
+                    }
                     ThreadBlock::Mutex(mutex_id) => {
                         if !self.mutex_state.mutex_is_locked(mutex_id) {
                             log_dbg!("Thread {} was unblocked due to mutex #{} unlocking, relocking mutex.", thread_id, mutex_id);
@@ -2294,12 +2916,25 @@ impl Environment {
                         }
                     }
                     ThreadBlock::Semaphore(sem) => {
-                        let host_sem_rc: &mut _ = self
-                            .libc_state
-                            .semaphore
-                            .open_semaphores
-                            .get_mut(&sem)
-                            .unwrap();
+                        // The semaphore a thread is waiting on may have been
+                        // destroyed (e.g. sem_destroy / sem_close) while the
+                        // thread was still blocked. Rather than panicking, treat
+                        // a now-unknown semaphore as "the wait can no longer be
+                        // satisfied here" and wake the thread so it can return
+                        // from sem_wait (which fails with EINVAL) instead of
+                        // deadlocking or aborting the process.
+                        let Some(host_sem_rc) =
+                            self.libc_state.semaphore.open_semaphores.get_mut(&sem)
+                        else {
+                            log!(
+                                "Warning: thread {} was blocked on semaphore {:?} \
+                                 that no longer exists; waking it.",
+                                thread_id,
+                                sem
+                            );
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        };
                         let mut host_sem = (*host_sem_rc).borrow_mut();
                         if host_sem.value > 0 {
                             log_dbg!(
@@ -2309,7 +2944,7 @@ impl Environment {
                                 host_sem.value
                             );
                             host_sem.value -= 1;
-                            host_sem.waiting.remove(&self.current_thread);
+                            host_sem.waiting.remove(&thread_id);
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
                         }
@@ -2401,8 +3036,16 @@ impl Environment {
                             // Write the return value, unless the pointer to
                             // write to is null.
                             if !ptr.is_null() {
-                                self.mem
-                                    .write(ptr, self.threads[joinee_thread].return_value.unwrap());
+                                if let Some(rv) = self.threads[joinee_thread].return_value {
+                                    self.mem.write(ptr, rv);
+                                } else {
+                                    log_dbg!(
+                                        "Thread {} joined thread {} which has no return value (pthread_exit?); writing NULL",
+                                        self.current_thread,
+                                        joinee_thread
+                                    );
+                                    self.mem.write(ptr, Ptr::null());
+                                }
                             }
                             self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
@@ -2497,25 +3140,35 @@ impl Environment {
         // the coroutine boundary so it's ok.
         unsafe impl Send for WindowWrapper<'_> {}
 
+        const NO_WINDOW_MSG: &str =
+            "on_parent_stack_in_coroutine() was called while touchHLE is running in \
+             headless mode (no window). This function is only for code paths that \
+             need a real window (e.g. OpenGL ES, text input, dialogs); headless-safe \
+             callers must check env.window.is_none() first and skip the window-only \
+             work instead of routing through here.";
+
         if !self.yielder.is_null() {
             unsafe {
                 let yielder = self.yielder.as_ref().unwrap();
                 let wrapped = WindowWrapper {
-                    window: self.window.as_mut().unwrap(),
+                    window: self.window.as_mut().expect(NO_WINDOW_MSG),
                 };
                 let res = yielder.on_parent_stack(|| {
                     let wrapped = wrapped;
                     wrapped.window.on_main_stack = true;
                     f(wrapped.window, self.options.as_mut())
                 });
-                self.window.as_mut().unwrap().on_main_stack = false;
+                self.window.as_mut().expect(NO_WINDOW_MSG).on_main_stack = false;
                 res
             }
         } else {
             if let Some(w) = self.window.as_mut() {
                 w.on_main_stack = true;
             }
-            f(self.window.as_mut().unwrap(), self.options.as_mut())
+            f(
+                self.window.as_mut().expect(NO_WINDOW_MSG),
+                self.options.as_mut(),
+            )
         }
     }
 }

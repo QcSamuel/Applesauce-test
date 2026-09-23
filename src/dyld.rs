@@ -20,13 +20,14 @@
 //! See [crate::mach_o] for resources.
 
 mod dylib_list;
+mod swift_runtime;
 
 use crate::abi::{CallFromGuest, GuestFunction};
 use crate::bundle;
 use crate::cpu::Cpu;
 use crate::frameworks::foundation::ns_string;
 use crate::mach_o::{MachO, SectionType};
-use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{nil, ClassExports, ObjC};
 use crate::Environment;
 use std::collections::HashMap;
@@ -220,17 +221,19 @@ fn link_cxxabi_vtable(
     cxxabi_vtable_addrs: &mut HashMap<String, u32>,
     mem: &mut Mem,
 ) -> ConstVoidPtr {
-    let addr = *cxxabi_vtable_addrs.entry(name.to_string()).or_insert_with(|| {
-        let stub = alloc_a32_ret_stub(mem);
-        let stub_addr = stub.to_bits();
-        let v: MutPtr<u32> = mem.alloc(40).cast();
-        mem.write(v + 0, 0);
-        mem.write(v + 1, 0);
-        for i in 2..10 {
-            mem.write(v + i, stub_addr);
-        }
-        v.to_bits()
-    });
+    let addr = *cxxabi_vtable_addrs
+        .entry(name.to_string())
+        .or_insert_with(|| {
+            let stub = alloc_a32_ret_stub(mem);
+            let stub_addr = stub.to_bits();
+            let v: MutPtr<u32> = mem.alloc(40).cast();
+            mem.write(v + 0, 0);
+            mem.write(v + 1, 0);
+            for i in 2..10 {
+                mem.write(v + i, stub_addr);
+            }
+            v.to_bits()
+        });
     Ptr::from_bits(addr).cast_const()
 }
 
@@ -399,6 +402,12 @@ pub struct Dyld {
     thread_exit_routine: Option<GuestFunction>,
     constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+    /// Cache of Swift runtime function trampolines (see `swift_runtime`).
+    swift_fn_cache: HashMap<String, GuestFunction>,
+    /// Interned `&'static str` copies of Swift symbol names.
+    swift_fn_names: HashMap<String, &'static str>,
+    /// Stable data slots for Swift metadata symbols.
+    swift_data_slots: HashMap<String, u32>,
 }
 
 impl Dyld {
@@ -429,6 +438,9 @@ impl Dyld {
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
             non_lazy_host_functions: HashMap::new(),
+            swift_fn_cache: HashMap::new(),
+            swift_fn_names: HashMap::new(),
+            swift_data_slots: HashMap::new(),
         }
     }
 
@@ -658,7 +670,13 @@ impl Dyld {
                 if name.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')) {
                     let sanitized: String = name
                         .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() || c == '$' { c } else { '_' })
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || c == '$' {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
                         .collect();
                     writeln!(file, "int {sanitized} asm(\"{constant_symbol}\");")?;
                 } else {
@@ -915,12 +933,7 @@ impl Dyld {
                         .create_proc_address_no_inval(mem, sym)
                         .unwrap()
                         .to_ptr();
-                    log_dbg!(
-                        "Linked {} -> {} at {:?}",
-                        name,
-                        target_name,
-                        trampoline_ptr
-                    );
+                    log_dbg!("Linked {} -> {} at {:?}", name, target_name, trampoline_ptr);
                     trampoline_ptr
                 } else {
                     // Fallback: a BX LR stub that returns 0
@@ -942,10 +955,17 @@ impl Dyld {
                 || name == "__ZTIPc"
                 || name == "__ZTIPv"
                 || name == "__ZTIPKv"
+                || name == "__ZTIw"
+                || name == "__ZTIPw"
+                || name == "__ZTIPKw"
+                || name == "__ZTIw"
+                || name == "__ZTIPw"
+                || name == "__ZTIPKw"
             {
                 // C++ RTTI type_info objects for fundamental types (double,
                 // float, int, long, unsigned int, short, char, void, bool,
-                // const char*, char*, void*, const void*).
+                // wchar_t, const char*, char*, void*, const void*,
+                // wchar_t*, wchar_t const*).
                 //
                 // The Itanium ABI requires each fundamental type to have a
                 // unique type_info object with a specific mangled name. Apps
@@ -1047,6 +1067,15 @@ impl Dyld {
                     mem.write(p + i, 0);
                 }
                 p.cast().cast_const()
+            } else if let Some(stub) = self.cxxabi_intercept(mem, name) {
+                Ptr::<std::ffi::c_void, false>::from_bits(stub.to_ptr().to_bits())
+            } else if let Some(link) = self.swift_intercept(mem, name) {
+                match link {
+                    swift_runtime::SwiftLink::Function(f) => {
+                        Ptr::<std::ffi::c_void, false>::from_bits(f.to_ptr().to_bits())
+                    }
+                    swift_runtime::SwiftLink::Data(slot) => slot,
+                }
             } else if let Some(&external_addr) = bins
                 .iter()
                 .flat_map(|other_bin| other_bin.exported_symbols.get(name))
@@ -1069,7 +1098,9 @@ impl Dyld {
                     trampoline_ptr
                 );
                 trampoline_ptr
-            } else if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, name) {
+            } else if let Some((_, template)) =
+                search_host_dylibs(|dylib| dylib.constant_exports, name)
+            {
                 // Constants from host dylibs need late linking (they may
                 // require a full Environment to resolve, e.g. NSString
                 // objects). Store for resolution in do_late_linking().
@@ -1144,6 +1175,35 @@ impl Dyld {
                     trampoline_ptr
                 );
                 continue;
+            }
+
+            // `objc_msgSendSuper` / `objc_msgSendSuper_stret` referenced
+            // through `__nl_symbol_ptr` (same symbols as the special case in
+            // the external-relocation loop above: apps built with older
+            // toolchains emit non-lazy references from SDK stubs). Resolve to
+            // the existing host `objc_msgSendSuper2` / `_stret` trampolines.
+            if symbol == "_objc_msgSendSuper" || symbol == "_objc_msgSendSuper_stret" {
+                let target_name = if symbol == "_objc_msgSendSuper" {
+                    "_objc_msgSendSuper2"
+                } else {
+                    "_objc_msgSendSuper2_stret"
+                };
+                if let Some((sym, _)) =
+                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
+                {
+                    let trampoline_ptr = self
+                        .create_proc_address_no_inval(mem, sym)
+                        .unwrap()
+                        .to_ptr();
+                    mem.write(ptr_ptr, trampoline_ptr);
+                    log_dbg!(
+                        "Linked non-lazy {} -> {} at {:?}",
+                        symbol,
+                        target_name,
+                        trampoline_ptr
+                    );
+                    continue;
+                }
             }
 
             if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
@@ -1332,6 +1392,22 @@ impl Dyld {
             // C++ RTTI type_info objects for fundamental types (double,
             // float, int, long, unsigned int, short, char, void, bool,
             // const char*, char*, void*, const void*). Without these the
+            // Swift runtime symbols (`__swift_retain`, `__T0SSN` type
+            // metadata, `__T0*Ma` accessors, …). Swift binaries (e.g. Alto's
+            // Adventure) reference these from `__nl_symbol_ptr`; leaving them
+            // NULL kills the app during Swift initialization.
+            if let Some(link) = self.swift_intercept(mem, symbol) {
+                let target = match link {
+                    swift_runtime::SwiftLink::Function(f) => f.to_ptr(),
+                    swift_runtime::SwiftLink::Data(slot) => {
+                        crate::mem::Ptr::from_bits(slot.to_bits())
+                    }
+                };
+                mem.write(ptr_ptr, target.cast());
+                log_dbg!("Linked Swift runtime symbol {} at {:#x}", symbol, target.to_bits());
+                continue;
+            }
+
             // referenced type_info object has a NULL vptr; the first call
             // through it (dynamic_cast / exception type matching / the
             // `typeid(...)` comparison libstdc++ does for `const char*`)
@@ -1352,6 +1428,12 @@ impl Dyld {
                 || symbol == "__ZTIPc"
                 || symbol == "__ZTIPv"
                 || symbol == "__ZTIPKv"
+                || symbol == "__ZTIw"
+                || symbol == "__ZTIPw"
+                || symbol == "__ZTIPKw"
+                || symbol == "__ZTIw"
+                || symbol == "__ZTIPw"
+                || symbol == "__ZTIPKw"
             {
                 let ti = link_cxxabi_typeinfo(symbol, &mut cxxabi_vtable_addrs, mem);
                 mem.write(ptr_ptr, ti);
@@ -1544,6 +1626,28 @@ impl Dyld {
             return None;
         }
 
+        // Intercept C++ exception ABI symbols (e.g. `__cxa_throw`) before the
+        // guest dylibs: letting a real throw reach the guest unwinder ends in
+        // `std::terminate` → guest `exit(0)` (no unwinder on our side).
+        if let Some(stub) = self.cxxabi_intercept(mem, symbol) {
+            let (stub_function_ptr, la_symbol_ptr) = link_by_restoring_stub(
+                mem,
+                cpu,
+                stub.addr_with_thumb_bit(),
+                svc_pc,
+                info.entry_size,
+                pic_offset,
+            );
+            log!(
+                "Intercepted guest C++ exception ABI symbol {} -> host stub ({:?}/{:?})",
+                symbol,
+                stub_function_ptr,
+                la_symbol_ptr
+            );
+            // Restart execution at the (now rewritten) stub.
+            return None;
+        }
+
         // Prefer guest dylibs (libstdc++.6.dylib, libgcc_s.1.dylib, …) over
         // host dylib stubs. Apps that bundle their own libstdc++ rely on the
         // proper guest C++ ABI (`__cxa_throw`, `__cxa_begin_catch`, the SjLj
@@ -1672,6 +1776,10 @@ impl Dyld {
             return Ok(function_ptr);
         }
 
+        if let Some(stub) = self.cxxabi_intercept(mem, symbol) {
+            return Ok(stub);
+        }
+
         let &(symbol, f) = search_host_dylibs(|dylib| dylib.function_exports, symbol).ok_or(())?;
         if let Some(&cached_fn) = self.non_lazy_host_functions.get(symbol) {
             return Ok(cached_fn);
@@ -1697,8 +1805,111 @@ impl Dyld {
         let function_ptr: MutPtr<u32> = function_ptr.cast();
         mem.write(function_ptr + 0, encode_a32_svc(svc));
         mem.write(function_ptr + 1, encode_a32_ret());
+        // Crash diagnostics: map stub addresses to symbols so a FATAL SIGNAL
+        // report with `last guest PC` identifies the aborting host function.
+        log!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
     }
+
+    /// Intercepts guest C++ exception ABI symbols that must not reach the
+    /// guest's real unwinder (see `cxxabi_throw_intercept`). Returns the
+    /// linked host stub, or `None` if `name` isn't intercepted.
+    fn cxxabi_intercept(&mut self, mem: &mut Mem, name: &str) -> Option<GuestFunction> {
+        if name != "__cxa_throw" {
+            return None;
+        }
+        let sym: &'static str = "__cxa_throw";
+        if let Some(&cached) = self.non_lazy_host_functions.get(sym) {
+            return Some(cached);
+        }
+        let (_, f) = export_c_func!(cxxabi_throw_intercept(_, _, _));
+        let function_ptr = self.create_guest_function(mem, sym, f);
+        self.non_lazy_host_functions.insert(sym, function_ptr);
+        Some(function_ptr)
+    }
+}
+
+/// Host-side intercept for `__cxa_throw` (Itanium C++ ABI).
+///
+/// Direct `throw` statements in app/libstdc++ code call `__cxa_throw`, which
+/// normally starts real unwinding. touchHLE has no unwinder: the SjLj/LSDA
+/// walk ends in `std::terminate` → guest `exit(0)` (observed with CSR Racing:
+/// PlayHaven init threw, unwinder bailed, app exited during startup).
+///
+/// Instead of letting the throw reach the unwinder, first use the shared,
+/// validated frame-pointer recovery to return to an app caller. If there is no
+/// safe frame, retain the old no-op return as a last resort. The log line makes
+/// the root cause of each suppressed exception visible.
+fn cxxabi_throw_intercept(
+    env: &mut Environment,
+    exception: MutVoidPtr,
+    tinfo: MutVoidPtr,
+    _dest: MutVoidPtr,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+
+    // type_info layout (Itanium, 32-bit): +0 vptr, +4 `char const* name`.
+    let type_name = if !tinfo.is_null() {
+        let type_info: ConstPtr<ConstPtr<u8>> = tinfo.cast_const().cast();
+        let name_ptr: ConstPtr<u8> = env.mem.read(type_info + 1);
+        read_printable_guest_string(env, name_ptr, 64)
+    } else {
+        String::new()
+    };
+
+    // Best-effort `what()`: for `std::runtime_error`-style exceptions the
+    // user object is `[vptr, std::string]`; COW std::string holds a pointer
+    // to its rep at +4, and the character data lives at rep + 12.
+    let what = if !exception.is_null() {
+        let rep: ConstPtr<u8> = env.mem.read(exception.cast());
+        if !rep.is_null() {
+            read_printable_guest_string(env, unsafe { rep + 12 }, 96)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let continuation = crate::libc::cxxabi::unwind_to_app_frame(env);
+    let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        if let Some(continuation) = continuation {
+            log!(
+                "Suppressed guest C++ exception (no unwinder): type={} what={} at \
+                 exception={:?}; unwound to app frame {:#010x}.",
+                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception,
+                continuation.addr_with_thumb_bit()
+            );
+        } else {
+            log!(
+                "Suppressed guest C++ exception (no unwinder): type={} what={} at \
+                 exception={:?}; no safe frame, returning after the throw point.",
+                if type_name.is_empty() { "?" } else { &type_name[..] },
+                if what.is_empty() { "?" } else { &what[..] },
+                exception
+            );
+        }
+    }
+}
+
+/// Reads a NUL-terminated guest string defensively, keeping only printable
+/// ASCII. Never panics on NULL/garbage pointers (null-page reads are handled
+/// by `Mem::bytes_at`, garbage yields an empty string).
+fn read_printable_guest_string(env: &Environment, ptr: ConstPtr<u8>, max: usize) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let bytes = env.mem.bytes_at(ptr, max as GuestUSize);
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    bytes[..end]
+        .iter()
+        .filter(|&&b| (0x20..0x7f).contains(&b))
+        .map(|&b| b as char)
+        .collect()
 }
 
 fn dyld_stub_binder(_env: &mut Environment, _arg: u32) {

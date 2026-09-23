@@ -15,13 +15,13 @@ use crate::Environment;
 //
 // These are the keys apps put in the drawableProperties dictionary.
 // We export them as static strings so other modules can reference them.
-pub const kEAGLDrawablePropertyRetainedBacking: &str = "kEAGLDrawablePropertyRetainedBacking";
-pub const kEAGLDrawablePropertyColorFormat: &str = "kEAGLDrawablePropertyColorFormat";
+pub const kEAGLDrawablePropertyRetainedBacking: &str = "RetainedBacking";
+pub const kEAGLDrawablePropertyColorFormat: &str = "ColorFormat";
 
 // kEAGLColorFormat values
-pub const kEAGLColorFormatRGBA8: &str = "kEAGLColorFormatRGBA8";
-pub const kEAGLColorFormatRGB565: &str = "kEAGLColorFormatRGB565";
-pub const kEAGLColorFormatSRGBA8: &str = "kEAGLColorFormatSRGBA8";
+pub const kEAGLColorFormatRGBA8: &str = "RGBA8";
+pub const kEAGLColorFormatRGB565: &str = "RGB565";
+pub const kEAGLColorFormatSRGBA8: &str = "SRGBA8";
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -112,25 +112,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Scale / Retina Support
 
-- (CGFloat)contentScaleFactor {
-    // Жестко задаем масштаб 1.0 (стандартный не-Retina экран)
-    1.0
-}
-
-- (())setContentScaleFactor:(CGFloat)scale {
-    // Заглушка, чтобы игра не упала, если попытается сама установить масштаб
-    log_dbg!("CAEAGLLAYER setContentScaleFactor: {} (stubbed)", scale);
-}
-
-- (CGFloat)contentsScale {
-    // Жестко задаем масштаб 1.0 (стандартный не-Retina экран)
-    1.0
-}
-
-- (())setContentsScale:(CGFloat)scale {
-    // Заглушка, чтобы игра не упала, если попытается сама установить масштаб
-    log_dbg!("CAEAGLLAYER setContentsScale: {} (stubbed)", scale);
-}
+// NOTE: unlike the previous hardcoded-1.0 stubs, contentsScale is NOT
+// overridden here. It is inherited from CALayer, whose host object stores a
+// real `contents_scale` field. `UIView.init_common` seeds every view's
+// backing layer with the main screen's scale, so on retina devices (iPhone
+// 4/4s/5/5c, iPod touch 4/5, iPad 3/4/5/mini 2/3) the EAGL renderbuffer is
+// allocated at bounds * 2.0 and games render at native resolution instead of
+// being zoomed/cropped into a half-size framebuffer. Apps that explicitly
+// call setContentScaleFactor: / setContentsScale: round-trip correctly.
 
 - (id)initWithLayer:(id)layer {
     let _: () = msg![env; this setOpaque:true];

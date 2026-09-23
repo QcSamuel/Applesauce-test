@@ -7,7 +7,7 @@
 
 use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::libc::errno::{EDEADLK, EINVAL, ESRCH};
+use crate::libc::errno::{set_errno, EDEADLK, EINVAL, ESRCH};
 use crate::mem::{
     self, ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead, PAGE_SIZE,
 };
@@ -249,8 +249,10 @@ fn pthread_attr_setinheritsched(
     inheritsched: i32,
 ) -> i32 {
     check_magic!(env, attr, MAGIC_ATTR);
-    log!(
-        "TODO: pthread_attr_setinheritsched({:?}, {})",
+    // Scheduling inheritance is a hint only; the default (inherit) is
+    // always in effect in touchHLE, so accepting the call is correct.
+    log_dbg!(
+        "pthread_attr_setinheritsched({:?}, {}) (accepted)",
         attr,
         inheritsched
     );
@@ -454,7 +456,16 @@ pub fn pthread_exit(env: &mut Environment, retval: MutVoidPtr) {
 fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoidPtr>) -> i32 {
     let current_thread = env.current_thread;
     let curr_pthread_t = pthread_self(env);
-    let joinee_thread = State::get(env).threads.get_mut(&thread).unwrap().thread_id;
+    // POSIX: joining a thread handle that no longer exists (already exited
+    // and reclaimed, or a stale pthread_t) is ESRCH, not a panic. Guest code
+    // (e.g. Gameloft games on 3GS) can legally do this.
+    let Some(joinee_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} not found, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
 
     assert!(joinee_thread != 0);
     if joinee_thread == current_thread {
@@ -462,7 +473,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         return EDEADLK;
     }
 
-    let host_obj_curr = State::get(env).threads.get(&curr_pthread_t).unwrap();
+    let Some(host_obj_curr) = State::get(env).threads.get(&curr_pthread_t) else {
+        log_dbg!(
+            "pthread_join: current thread handle {:?} not registered, returning ESRCH",
+            curr_pthread_t
+        );
+        return ESRCH;
+    };
     if let Some(thread) = host_obj_curr.joined_by {
         if thread == joinee_thread {
             log_dbg!("Thread attempted deadlocking join, returning EDEADLK!");
@@ -470,7 +487,13 @@ fn pthread_join(env: &mut Environment, thread: pthread_t, retval: MutPtr<MutVoid
         }
     }
 
-    let host_obj_joinee = State::get(env).threads.get_mut(&thread).unwrap();
+    let Some(host_obj_joinee) = State::get(env).threads.get_mut(&thread) else {
+        log_dbg!(
+            "pthread_join: thread handle {:?} disappeared, returning ESRCH",
+            thread
+        );
+        return ESRCH;
+    };
     if host_obj_joinee.attr.detachstate == PTHREAD_CREATE_DETACHED {
         log_dbg!("Thread attempted join with detached thread, returning EINVAL!");
         return EINVAL;
@@ -627,32 +650,54 @@ fn pthread_get_stacksize_np(env: &mut Environment, thread: pthread_t) -> GuestUS
     }
 }
 
+/// `int pthread_getschedparam(pthread_t thread, int *policy,
+///                            struct sched_param *param)`
+///
+/// Reports the nominal scheduling attributes. All guest threads share the
+/// host scheduler and always run under the default `SCHED_OTHER` policy, so
+/// that is what gets reported.
 fn pthread_getschedparam(
-    _env: &mut Environment,
+    env: &mut Environment,
     thread: pthread_t,
-    policy: i32,
-    param: MutVoidPtr,
+    policy: MutPtr<i32>,
+    param: MutPtr<sched_param>,
 ) -> i32 {
-    log_dbg!(
-        "TODO: pthread_getschedparam({:?}, {}, {:?})",
-        thread,
-        policy,
-        param
-    );
+    if !State::get(env).threads.contains_key(&thread) {
+        set_errno(env, ESRCH);
+        return ESRCH;
+    }
+    // SCHED_OTHER (Darwin value).
+    env.mem.write(policy, 1);
+    env.mem.write(param, sched_param { sched_priority: 0 });
     0
 }
 
+/// `int pthread_setschedparam(pthread_t thread, int policy,
+///                            const struct sched_param *param)`
+///
+/// Guest threads cannot have their host scheduling policy changed from the
+/// guest, but Apple's implementation silently accepts `SCHED_OTHER` on
+/// non-realtime threads, so validate the policy and report success.
 fn pthread_setschedparam(
-    _env: &mut Environment,
+    env: &mut Environment,
     thread: pthread_t,
     policy: i32,
-    param: ConstVoidPtr,
+    param: ConstPtr<sched_param>,
 ) -> i32 {
+    if !State::get(env).threads.contains_key(&thread) {
+        set_errno(env, ESRCH);
+        return ESRCH;
+    }
+    // Darwin: SCHED_OTHER = 1, SCHED_FIFO = 2, SCHED_RR = 3.
+    if !(1..=3).contains(&policy) {
+        set_errno(env, EINVAL);
+        return EINVAL;
+    }
+    let _sched: sched_param = env.mem.read(param);
     log_dbg!(
-        "TODO: pthread_setschedparam({:?}, {}, {:?})",
+        "pthread_setschedparam({:?}, {}) accepted (no-op)",
         thread,
-        policy,
-        param
+        policy
     );
     0
 }
@@ -682,28 +727,48 @@ fn pthread_sigmask(
 }
 
 /// `pthread_kill` — send a signal to a specific thread.
-/// Not supported in HLE; returns 0 (success) to avoid app abort.
-fn pthread_kill(
-    _env: &mut Environment,
-    thread: pthread_t,
-    sig: i32,
-) -> i32 {
-    log_dbg!(
-        "pthread_kill(thread={:?}, sig={}) -> stub 0",
-        thread,
-        sig
-    );
-    0
+///
+/// Signal delivery in touchHLE is synchronous and runs on the calling guest
+/// thread (see `crate::libc::signal`), so a signal aimed at the calling
+/// thread is exactly `raise()`. A signal aimed at any *other* thread is
+/// delivered on the calling thread as well: refusing it would hang the
+/// crash reporters that signal a worker thread, and the only observable
+/// difference is the receiver's `pthread_self()`.
+fn pthread_kill(env: &mut Environment, thread: pthread_t, sig: i32) -> i32 {
+    // `sig == 0` is the documented way of asking whether a thread exists,
+    // without sending anything.
+    if sig == 0 {
+        return if State::get(env).threads.contains_key(&thread) {
+            0
+        } else {
+            ESRCH
+        };
+    }
+    let Some(target_thread) = State::get(env).threads.get(&thread).map(|t| t.thread_id) else {
+        // A stale or foreign pthread_t: this is what the real kernel
+        // reports when the thread does not exist.
+        return ESRCH;
+    };
+    if target_thread != env.current_thread {
+        log!(
+            "Warning: pthread_kill() targets thread {} while running on \
+             thread {}; delivering signal {} on the calling thread.",
+            target_thread,
+            env.current_thread,
+            sig
+        );
+    }
+    if crate::libc::signal::raise(env, sig) == 0 {
+        0
+    } else {
+        EINVAL
+    }
 }
 
 /// `pthread_attr_setscope` — set the contention scope attribute.
 /// On Darwin this is essentially always PTHREAD_SCOPE_SYSTEM.  We accept any
 /// value and return 0.
-fn pthread_attr_setscope(
-    _env: &mut Environment,
-    attr: MutVoidPtr,
-    scope: i32,
-) -> i32 {
+fn pthread_attr_setscope(_env: &mut Environment, attr: MutVoidPtr, scope: i32) -> i32 {
     log_dbg!(
         "pthread_attr_setscope(attr={:?}, scope={}) -> stub 0",
         attr,
@@ -731,7 +796,10 @@ fn pthread_getname_np(
         return EINVAL;
     }
     let Some(host_obj) = State::get(env).threads.get(&thread) else {
-        log_dbg!("pthread_getname_np: unknown thread {:?}, returning ESRCH", thread);
+        log_dbg!(
+            "pthread_getname_np: unknown thread {:?}, returning ESRCH",
+            thread
+        );
         return ESRCH;
     };
     let name = host_obj.name.clone();

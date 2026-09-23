@@ -63,6 +63,7 @@ impl GLESContext for GLES2NativeContext {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
+                map_buffer_stagings: Vec::new(),
             });
         }
         unsafe {
@@ -83,6 +84,7 @@ impl GLESContext for GLES2NativeContext {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
+            map_buffer_stagings: Vec::new(),
         })
     }
 
@@ -96,6 +98,7 @@ impl GLESContext for GLES2NativeContext {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
+                map_buffer_stagings: Vec::new(),
             });
         }
         make_current_fn(&self.gl_ctx);
@@ -111,6 +114,7 @@ impl GLESContext for GLES2NativeContext {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
+            map_buffer_stagings: Vec::new(),
         })
     }
 }
@@ -158,8 +162,7 @@ unsafe fn detect_texture_lod_ext_support() -> bool {
     if s.is_empty() {
         return false;
     }
-    s.split(' ')
-        .any(|ext| ext == "GL_EXT_shader_texture_lod")
+    s.split(' ').any(|ext| ext == "GL_EXT_shader_texture_lod")
 }
 
 /// Returns `true` if the shader source contains a top-level default float
@@ -345,12 +348,7 @@ fn replace_texture_lod_ext_calls(source: &str) -> String {
                 );
             } else {
                 // No comma found — just rename the function
-                result = format!(
-                    "{}{}{}",
-                    &result[..start],
-                    new_name,
-                    &result[end_of_name..]
-                );
+                result = format!("{}{}{}", &result[..start], new_name, &result[end_of_name..]);
             }
         }
     }
@@ -403,6 +401,13 @@ pub struct GLES2Native<'gl_ctx> {
     pvrtc_native: bool,
     /// Whether `GL_EXT_shader_texture_lod` is advertised by the host driver.
     texture_lod_ext_supported: bool,
+    /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
+    ///
+    /// Games can legitimately have more than one buffer mapped at a time
+    /// (e.g. Asphalt 8's Jet engine maps the vertex and the index buffer
+    /// simultaneously), so this is keyed by buffer target instead of being
+    /// a single slot that would silently drop the first mapping.
+    map_buffer_stagings: Vec<(GLenum, Vec<u8>)>,
 }
 
 /// Returns `true` if `cap` is an ES 1.1 fixed-function capability that has
@@ -711,7 +716,7 @@ impl GLES for GLES2Native<'_> {
         &mut self,
         target: GLenum,
         level: GLint,
-        internalformat: GLint,
+        mut internalformat: GLint,
         width: GLsizei,
         height: GLsizei,
         border: GLint,
@@ -719,6 +724,9 @@ impl GLES for GLES2Native<'_> {
         type_: GLenum,
         pixels: *const GLvoid,
     ) {
+        if format == gles11::BGRA_EXT {
+            internalformat = gles11::BGRA_EXT as GLint;
+        }
         gles2::TexImage2D(
             target,
             level,
@@ -1041,16 +1049,48 @@ impl GLES for GLES2Native<'_> {
     // `--prefer-gles2-context`, they end up here.
     unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
         if gles2::MapBufferOES::is_loaded() {
-            gles2::MapBufferOES(target, access)
-        } else {
-            log!(
-                "Warning: glMapBufferOES called but GL_OES_mapbuffer is not \
-                 available on this ES 2.0 driver; returning NULL"
-            );
-            std::ptr::null_mut()
+            let mapped = gles2::MapBufferOES(target, access);
+            if !mapped.is_null() {
+                return mapped;
+            }
+            // Driver exports the entry point but refuses the map (common on
+            // Adreno): fall through to the staging-buffer path below.
         }
+        // Fallback for drivers without `GL_OES_mapbuffer` (e.g. Asphalt 8's
+        // Jet engine maps vertex/index buffers with GL_WRITE_ONLY_OES to
+        // upload geometry). ES 2.0 core has no buffer readback, but games
+        // only ever map for writing, so hand out a CPU staging buffer sized
+        // to the current buffer store and upload it in `UnmapBufferOES`.
+        let mut size: GLint = 0;
+        gles2::GetBufferParameteriv(target, gles2::BUFFER_SIZE, &mut size);
+        if size <= 0 {
+            return std::ptr::null_mut();
+        }
+        let staging = vec![0u8; size as usize];
+        let ptr = staging.as_ptr();
+        // Replace any stale staging entry for this target (an unbalanced
+        // earlier map without unmap); keep other targets' entries intact.
+        match self.map_buffer_stagings.iter_mut().find(|(t, _)| *t == target) {
+            Some(entry) => *entry = (target, staging),
+            None => self.map_buffer_stagings.push((target, staging)),
+        }
+        ptr as *mut GLvoid
     }
     unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean {
+        if let Some(pos) = self
+            .map_buffer_stagings
+            .iter()
+            .position(|(mapped_target, _)| *mapped_target == target)
+        {
+            let (_, staging) = self.map_buffer_stagings.swap_remove(pos);
+            gles2::BufferSubData(
+                target,
+                0,
+                staging.len() as GLsizeiptr,
+                staging.as_ptr() as *const GLvoid,
+            );
+            return gles2::TRUE;
+        }
         if gles2::UnmapBufferOES::is_loaded() {
             gles2::UnmapBufferOES(target)
         } else {
@@ -1167,8 +1207,7 @@ impl GLES for GLES2Native<'_> {
             let s = if !length.is_null() {
                 let len = *length.add(i);
                 if len >= 0 {
-                    let slice =
-                        std::slice::from_raw_parts(raw_ptr as *const u8, len as usize);
+                    let slice = std::slice::from_raw_parts(raw_ptr as *const u8, len as usize);
                     std::str::from_utf8(slice).unwrap_or("").to_owned()
                 } else {
                     CStr::from_ptr(raw_ptr).to_string_lossy().into_owned()
@@ -1453,6 +1492,53 @@ impl GLES for GLES2Native<'_> {
         gles2::IsVertexArrayOES(array)
     }
 
+    // Boolean occlusion queries (GL_EXT_occlusion_query_boolean). ES 2.0 has no
+    // core query objects, so we forward to the driver's `*EXT` entry points.
+    // These are the exact functions iPhone OS games (e.g. Rush Rally 2) call
+    // through the `glGenQueriesEXT` family of symbols.
+    // Reference: https://registry.khronos.org/OpenGL/extensions/EXT/EXT_occlusion_query_boolean.txt
+    unsafe fn GenQueries(&mut self, n: GLsizei, ids: *mut GLuint) {
+        if gles2::GenQueriesEXT::is_loaded() {
+            gles2::GenQueriesEXT(n, ids)
+        } else {
+            log_once!(
+                "GenQueries: driver does not expose GL_EXT_occlusion_query_boolean [stubbed]"
+            );
+        }
+    }
+    unsafe fn DeleteQueries(&mut self, n: GLsizei, ids: *const GLuint) {
+        if gles2::DeleteQueriesEXT::is_loaded() {
+            gles2::DeleteQueriesEXT(n, ids)
+        }
+    }
+    unsafe fn IsQuery(&mut self, id: GLuint) -> GLboolean {
+        if gles2::IsQueryEXT::is_loaded() {
+            gles2::IsQueryEXT(id)
+        } else {
+            gles2::FALSE
+        }
+    }
+    unsafe fn BeginQuery(&mut self, target: GLenum, id: GLuint) {
+        if gles2::BeginQueryEXT::is_loaded() {
+            gles2::BeginQueryEXT(target, id)
+        }
+    }
+    unsafe fn EndQuery(&mut self, target: GLenum) {
+        if gles2::EndQueryEXT::is_loaded() {
+            gles2::EndQueryEXT(target)
+        }
+    }
+    unsafe fn GetQueryiv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        if gles2::GetQueryivEXT::is_loaded() {
+            gles2::GetQueryivEXT(target, pname, params)
+        }
+    }
+    unsafe fn GetQueryObjectuiv(&mut self, id: GLuint, pname: GLenum, params: *mut GLuint) {
+        if gles2::GetQueryObjectuivEXT::is_loaded() {
+            gles2::GetQueryObjectuivEXT(id, pname, params)
+        }
+    }
+
     // Uniforms
     unsafe fn Uniform1f(&mut self, location: GLint, v0: GLfloat) {
         gles2::Uniform1f(location, v0)
@@ -1596,6 +1682,27 @@ impl GLES for GLES2Native<'_> {
     // keeps the existing `present_renderbuffer` save/restore code paths quiet
     // without crashing. Real apps that rely on a true ES 2.0 driver will not
     // call these.
+    unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Fogx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Fogfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Fogxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Lightf(&mut self, _light: GLenum, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Lightx(&mut self, _light: GLenum, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Lightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Lightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn LightModelf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn LightModelx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn LightModelfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn LightModelxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn Materialf(&mut self, _face: GLenum, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn Materialx(&mut self, _face: GLenum, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn Materialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn Materialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *const GLfixed) {}
+    unsafe fn GetLightfv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfloat) {}
+    unsafe fn GetLightxv(&mut self, _light: GLenum, _pname: GLenum, _params: *mut GLfixed) {}
+    unsafe fn GetMaterialfv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfloat) {}
+    unsafe fn GetMaterialxv(&mut self, _face: GLenum, _pname: GLenum, _params: *mut GLfixed) {}
+
     unsafe fn ClientActiveTexture(&mut self, _texture: GLenum) {}
     unsafe fn EnableClientState(&mut self, _array: GLenum) {}
     unsafe fn DisableClientState(&mut self, _array: GLenum) {}

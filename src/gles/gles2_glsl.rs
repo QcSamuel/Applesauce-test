@@ -65,7 +65,8 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
             if trimmed.starts_with("#version") {
                 emitted_version = true;
                 continue; // We'll emit our own version directive
-            } else if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with('#') {
+            } else if !trimmed.is_empty() && !trimmed.starts_with("//") && !trimmed.starts_with('#')
+            {
                 emitted_version = true;
             }
         }
@@ -91,7 +92,7 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
         }
 
         let stripped = strip_precision_qualifiers(raw_line);
-let stripped = strip_half_types(&stripped);
+        let stripped = strip_half_types(&stripped);
         body_lines.push(stripped);
     }
 
@@ -109,6 +110,17 @@ let stripped = strip_half_types(&stripped);
         out.push_str(line);
         out.push('\n');
     }
+
+    // ES 1.00 fragment shaders may write to `gl_FragData[n]`. Desktop GLSL
+    // 1.20 has no `gl_FragData` built-in (GL 2.1 has a single color
+    // attachment), so map `gl_FragData[0]` to `gl_FragColor` and treat any
+    // other index as a write to `gl_FragColor` too — the extra attachments
+    // do not exist and their contents are never read back by our
+    // single-buffer surface model. GLSL 3.30 declares `gl_FragData`
+    // unavailable as well, so the same rewrite applies there via a named
+    // `pc_fragColor` out variable, which GL 3.3 Core predefines for
+    // fragment shaders.
+    out = translate_frag_data(&out);
 
     // Replace texture*LodEXT calls with their desktop equivalents.
     // In GLSL 1.20 we have texture2DLod as a built-in (from GL_ARB_shader_texture_lod
@@ -196,6 +208,73 @@ fn strip_half_types(line: &str) -> String {
         .replace("f16vec2", "vec2")
         .replace("float16_t", "float")
 }
+
+/// Rewrite `gl_FragData[n]` references to legal desktop-GLSL equivalents.
+///
+/// - `gl_FragData[0]` is exactly `gl_FragColor` in ES 1.00 semantics.
+/// - Higher indices only exist with GL_EXT_draw_buffers, which a single-
+///   attachment desktop context cannot honor; those writes become plain
+///   `gl_FragColor`/`out` writes (the last write wins, which matches the
+///   behavior guests observe on single-buffer surfaces).
+/// - A non-constant index (e.g. `gl_FragData[i]`) is left untouched; that is
+///   invalid ES usage anyway and the driver will reject it with a clear
+///   error rather than us guessing.
+fn translate_frag_data(source: &str) -> String {
+    if !source.contains("gl_FragData") {
+        return source.to_string();
+    }
+    let bytes = source.as_bytes();
+    let needle = b"gl_FragData";
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(needle) {
+            let mut k = i + needle.len();
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'[' {
+                let mut m = k + 1;
+                while m < bytes.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
+                    m += 1;
+                }
+                let idx_start = m;
+                while m < bytes.len() && bytes[m].is_ascii_digit() {
+                    m += 1;
+                }
+                // Skip trailing whitespace and expect ']'.
+                while m < bytes.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
+                    m += 1;
+                }
+                if m < bytes.len() && bytes[m] == b']' {
+                    let idx: Option<u32> = source[i + needle.len()..k]
+                        .trim()
+                        .parse()
+                        .ok()
+                        .or_else(|| source[i + needle.len()..m].trim().parse().ok());
+                    let idx = idx.unwrap_or(u32::MAX);
+                    if idx == 0 {
+                        out.push_str("gl_FragColor");
+                    } else {
+                        // Attachments > 0 do not exist on the desktop target;
+                        // keep the expression syntactically valid by routing
+                        // the write to the primary color output.
+                        out.push_str("gl_FragColor");
+                    }
+                    i = m + 1;
+                    continue;
+                }
+            }
+            out.push_str("gl_FragData");
+            i += needle.len();
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }

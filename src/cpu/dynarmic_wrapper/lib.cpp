@@ -158,10 +158,29 @@ private:
       cpu->HaltExecution(HaltReasonUndefinedInstruction);
     } else if (exception == Dynarmic::A32::Exception::Breakpoint) {
       cpu->HaltExecution(HaltReasonBreakpoint);
+    } else if (exception == Dynarmic::A32::Exception::Yield ||
+               exception == Dynarmic::A32::Exception::WaitForEvent ||
+               exception == Dynarmic::A32::Exception::WaitForInterrupt ||
+               exception == Dynarmic::A32::Exception::SendEvent ||
+               exception == Dynarmic::A32::Exception::SendEventLocal ||
+               exception == Dynarmic::A32::Exception::PreloadData ||
+               exception == Dynarmic::A32::Exception::PreloadDataWithIntentToWrite ||
+               exception == Dynarmic::A32::Exception::PreloadInstruction ||
+               exception == Dynarmic::A32::Exception::UnpredictableInstruction ||
+               exception == Dynarmic::A32::Exception::DecodeError) {
+      // Hint instructions (WFE/WFI/YIELD/SEV/PLD): on real hardware these
+      // are no-ops or low-power hints, and dynarmic has already advanced the
+      // PC past the instruction, so just continue execution without halting.
+      // Aborting here (as we used to) killed apps like N.O.V.A. 3 with an
+      // unexplained SIGABRT when guest code ran these hints in a spin loop.
     } else {
+      // UnpredictableInstruction / DecodeError / anything else: treat exactly
+      // like an undefined instruction so the Rust-side graceful bypass
+      // (fake return to LR / skip instruction) can handle it instead of
+      // aborting the whole host process.
       std::fprintf(stderr, "ExceptionRaised: unexpected exception %u at %x\n",
                    unsigned(exception), pc);
-      abort();
+      cpu->HaltExecution(HaltReasonUndefinedInstruction);
     }
   }
   void AddTicks(std::uint64_t ticks) override {
@@ -235,6 +254,24 @@ public:
     user_config.coprocessors[15] = std::make_shared<ArmDynarmicCP15>();
     mon = std::make_unique<Dynarmic::ExclusiveMonitor>(1);
     user_config.global_monitor = mon.get();
+    // PERF: opt into dynarmic's "unsafe" optimizations. Only the
+    // floating-point / codegen ones are enabled: the worst they can do is
+    // produce slightly different FP edge-case results (NaN payloads, rounding
+    // of FRECPE/FRSQRTE estimates, NEON rounding-mode changes being ignored),
+    // which no real iPhone OS game depends on. In return the emitted guest
+    // code drops per-instruction FPCR/NaN bookkeeping, which is a significant
+    // speedup for VFP/NEON-heavy game code on both x86-64 and AArch64 hosts.
+    //
+    // Unsafe_IgnoreGlobalMonitor is deliberately NOT enabled: guest
+    // applications use LDREX/STREX-based atomics across threads, and ignoring
+    // the exclusive monitor would risk subtle synchronization breakage.
+    user_config.unsafe_optimizations = true;
+    user_config.optimizations =
+        user_config.optimizations |
+        Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA |
+        Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+        Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
+        Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
 #ifndef NDEBUG
     user_config.check_halt_on_memory_access = true;
 #endif

@@ -298,7 +298,11 @@ unsafe impl<T, const MUT: bool> SafeRead for Ptr<T, MUT> {}
 pub trait SafeWrite: Sized {}
 impl<T: SafeRead> SafeWrite for T {}
 
-type Bytes = [u8; 1 << 32];
+// XaView BypassOOBPanic: extend the guest address space by one page past the
+// 4 GiB boundary so that off-by-one/OOB guest addresses (e.g. computations
+// yielding 0x1_0000_0000..0x1_0000_0fff) stay addressable instead of tripping
+// range assertions in the memory accessors.
+type Bytes = [u8; (1_usize << 32) + 4096];
 pub const PAGE_SIZE: GuestUSize = 4096;
 pub const PAGE_SIZE_ALIGN_MASK: GuestUSize = 0xfff;
 
@@ -505,6 +509,14 @@ impl Mem {
             return;
         }
         set.insert(key);
+        if size > 0x1000_0000 {
+            // Huge size is almost always a corrupted/-1 length; capture a
+            // backtrace to identify the offending host function.
+            log!(
+                "touchHLE::mem: backtrace for huge-size NULL-PAGE/OOB access:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         let op_type = if is_write { "WRITE" } else { "READ" };
         // Provide helpful context: small offsets are typically field accesses
         // on a nil Objective-C object pointer (nil + ivar offset). This is
@@ -575,6 +587,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at] for that).
+    #[inline]
     pub fn bytes_at<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -640,6 +653,7 @@ impl Mem {
     /// 0. This may be inconvenient in some cases, but it makes the behavior
     /// when deriving a pointer from the slice consistent (though you should use
     /// [Self::ptr_at_mut] for that).
+    #[inline]
     pub fn bytes_at_mut(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
         // ХАК: Вместо паники логируем и возвращаем данные из stub-страницы
         if ptr.to_bits() < self.null_segment_size {
@@ -684,6 +698,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>, count: GuestUSize) -> *const T
     where
         T: SafeRead,
@@ -720,6 +735,7 @@ impl Mem {
     /// Rust strictly requires pointers to be
     /// well-aligned when dereferencing them, or when constructing references or
     /// slices from them, so **be very careful**.
+    #[inline]
     pub fn ptr_at_mut<T>(&mut self, ptr: MutPtr<T>, count: GuestUSize) -> *mut T
     where
         T: SafeRead + SafeWrite,
@@ -739,7 +755,10 @@ impl Mem {
         let guest_mem_range = self.bytes().as_ptr_range();
         assert!(guest_mem_range.contains(&host_ptr));
         let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
-        Ptr::from_bits(u32::try_from(guest_addr).unwrap())
+        // XaView BypassGuestAddrOverflow: the extended address space (see
+        // `Bytes`) can legitimately produce addresses past 32 bits; truncate
+        // instead of panicking.
+        Ptr::from_bits(guest_addr as u32)
     }
 
     /// Returns whether a host pointer addresses a location inside the guest's
@@ -754,6 +773,7 @@ impl Mem {
     /// Read a value for memory.
     /// This is the preferred way to read memory in
     /// most cases.
+    #[inline]
     pub fn read<T, const MUT: bool>(&self, ptr: Ptr<T, MUT>) -> T
     where
         T: SafeRead,
@@ -766,6 +786,7 @@ impl Mem {
     /// Write a value to memory.
     /// This is the preferred way to write memory in
     /// most cases.
+    #[inline]
     pub fn write<T>(&mut self, ptr: MutPtr<T>, value: T)
     where
         T: SafeWrite,
@@ -896,15 +917,61 @@ impl Mem {
         self.allocator.is_known_allocation(addr)
     }
 
+    /// Returns a snapshot of all currently-live heap allocations as
+    /// `(base_address, size_in_bytes)` pairs.
+    ///
+    /// This is used by the RTCV-style memory corruption engine
+    /// ([crate::corrupt]) so it can target only memory the guest has actually
+    /// allocated, which keeps corruption "interesting" (it mangles live game
+    /// state) while avoiding writes to unmapped address space that would just
+    /// crash the emulator immediately.
+    pub fn live_allocations(&self) -> Vec<(GuestUSize, GuestUSize)> {
+        self.allocator.live_allocations()
+    }
+
+    /// Corrupt a single byte of guest memory at `addr` by replacing it with
+    /// `value`, RTCV "Blast"-style. Returns the previous byte value.
+    ///
+    /// SAFETY/CORRECTNESS: `addr` must lie within a live allocation (see
+    /// [Self::live_allocations]). The corruption engine guarantees this.
+    pub fn corrupt_byte(&mut self, addr: GuestUSize, value: u8) -> u8 {
+        let ptr: MutPtr<u8> = Ptr::from_bits(addr);
+        let slice = self.bytes_at_mut(ptr, 1);
+        let old = slice[0];
+        slice[0] = value;
+        old
+    }
+
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
         if old_ptr.is_null() {
             return self.alloc(size);
         }
 
-        // TODO: for a moment we always assume that we do not have enough size
-        //       to realloc inplace
         let old_size = self.allocator.find_allocated_size(old_ptr.to_bits());
         if old_size >= size {
+            return old_ptr;
+        }
+
+        // Fast path: if the memory right after the allocation happens to be
+        // free, grow the allocation in place instead of allocating a new
+        // block, copying everything and freeing the old one. Apps that grow
+        // buffers repeatedly (arrays, string builders, asset loading) hit
+        // this path a lot.
+        if let Some(grown_size) = self
+            .allocator
+            .grow_in_place(old_ptr.to_bits(), old_size, size)
+        {
+            // Mirror `alloc`: memory is only pre-zeroed when the allocator
+            // is configured to hand out zeroed memory; zero just the tail.
+            if self.zero_memory_on_free {
+                self.bytes_at_mut(old_ptr.cast(), grown_size)[old_size as usize..].fill(0);
+            }
+            log_dbg!(
+                "Reallocated in place {:?} ({:#x} -> {:#x} bytes)",
+                old_ptr,
+                old_size,
+                grown_size
+            );
             return old_ptr;
         }
 
@@ -978,11 +1045,7 @@ impl Mem {
     /// larger than 64KB (e.g. GLSL shader source uploaded via `glShaderSource`
     /// without an explicit length), where the default cap would silently
     /// truncate the string and corrupt it.
-    pub fn cstr_at_with_max_len<const MUT: bool>(
-        &self,
-        ptr: Ptr<u8, MUT>,
-        max_len: u32,
-    ) -> &[u8] {
+    pub fn cstr_at_with_max_len<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, max_len: u32) -> &[u8] {
         let mut len: u32 = 0;
         while self.read(ptr + len) != b'\0' {
             len += 1;

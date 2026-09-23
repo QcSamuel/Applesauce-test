@@ -15,6 +15,7 @@
 use crate::gles::present::present_frame;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext, GLES,
+    LoggingGLESContext,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -24,6 +25,7 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -112,7 +114,10 @@ impl DeviceFamily {
     }
 
     pub fn is_phone_568(&self) -> bool {
-        matches!(self, DeviceFamily::iPhone5 | DeviceFamily::iPhone5c | DeviceFamily::iPodTouch5)
+        matches!(
+            self,
+            DeviceFamily::iPhone5 | DeviceFamily::iPhone5c | DeviceFamily::iPodTouch5
+        )
     }
 
     pub fn is_retina(&self) -> bool {
@@ -218,9 +223,7 @@ impl DeviceFamily {
             // intentionally cap this at 1 GiB even though the address space is
             // 4 GiB, leaving headroom for the guest heap, stacks and mapped
             // libraries.
-            DeviceFamily::iPad5
-            | DeviceFamily::iPadMini2
-            | DeviceFamily::iPadMini3 => 1024 * MIB,
+            DeviceFamily::iPad5 | DeviceFamily::iPadMini2 | DeviceFamily::iPadMini3 => 1024 * MIB,
         }
     }
 
@@ -430,6 +433,50 @@ fn set_sdl2_orientation(orientation: DeviceOrientation, landscape_both_direction
     );
 }
 
+/// COMPAT: per-game accelerometer axis remap, applied to real-sensor data in
+/// the hardware path of [Window::get_acceleration].
+///
+/// The values delivered to the guest are always in the device's portrait
+/// frame (iOS semantics), which is correct for games that honour their
+/// declared interface orientation. Some games, however, hard-code their
+/// tilt math for one particular way of holding the phone — or the host
+/// device reports sensors in a natural-orientation frame some games don't
+/// expect (e.g. tablets) — and then steering/camera controls come out
+/// mirrored or sideways (seen with e.g. Asphalt 7's tilt camera).
+///
+/// `TOUCHHLE_ACCELEROMETER_AXES` accepts a comma-separated list of:
+/// - "swap": transpose x and y (sideways behaviour on some devices)
+/// - "flipx": negate x (left/right inversion)
+/// - "flipy": negate y (forward/backward inversion)
+/// Both flips together make a 180-degree fix; all three together swap and
+/// flip. Example: TOUCHHLE_ACCELEROMETER_AXES=swap,flipy
+///
+/// The knob is read once and cached. Gyroscope readings are NOT remapped.
+fn accelerometer_compat_remap(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    let (swap, flipx, flipy) = *CACHE.get_or_init(|| {
+        let var = std::env::var("TOUCHHLE_ACCELEROMETER_AXES").unwrap_or_default();
+        let var = var.to_ascii_lowercase();
+        (
+            var.contains("swap"),
+            var.contains("flipx"),
+            var.contains("flipy"),
+        )
+    });
+    let (mut x, mut y) = (x, y);
+    if swap {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if flipx {
+        x = -x;
+    }
+    if flipy {
+        y = -y;
+    }
+    (x, y, z)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FingerId {
     Mouse,
@@ -463,6 +510,17 @@ pub enum Event {
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
     AppWillResignActive,
+    /// OS has informed touchHLE it has become inactive and entered the
+    /// background. (iOS `applicationDidEnterBackground:`, Android
+    /// `onPause()` completing / activity no longer visible)
+    AppDidEnterBackground,
+    /// OS has informed touchHLE it is about to leave the background and
+    /// re-enter the foreground. (iOS `applicationWillEnterForeground:`,
+    /// Android `onResume()` starting)
+    AppWillEnterForeground,
+    /// OS has informed touchHLE it has become active again after being
+    /// inactive/backgrounded. (iOS `applicationDidBecomeActive:`)
+    AppDidBecomeActive,
     /// OS has informed touchHLE it will soon terminate.
     /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
     AppWillTerminate,
@@ -543,6 +601,174 @@ pub fn host_screen_size() -> Option<(u32, u32)> {
     }
 }
 
+/// Choose between Google's ANGLE (when this Android build was packaged with
+/// it) and the vendor-native OpenGL ES driver, and point SDL's EGL / GLES
+/// loader at the chosen one.
+///
+/// SDL loads its EGL and GLES libraries with `dlopen` at context-creation time
+/// and honours the `SDL_VIDEO_EGL_DRIVER` / `SDL_VIDEO_GL_DRIVER` environment
+/// variables (see SDL's `src/video/SDL_egl.c`). ANGLE ships as a pair of shared
+/// libraries — an `libEGL` and an `libGLESv2` — so to avoid clashing with the
+/// system driver of the same name we look for the conventional ANGLE-suffixed
+/// sonames (`libEGL_angle.so` / `libGLESv2_angle.so`), which is how ANGLE is
+/// packaged inside an APK's native library directory.
+///
+/// Why there is a choice at all: ANGLE was adopted because the vendors' native
+/// OpenGL ES **1.1** drivers (Qualcomm Adreno's in particular) are strict or
+/// buggy in ways that leave early iPhone OS games with a black screen. The
+/// vendors' OpenGL ES **2.0/3.x** drivers, on the other hand, are the path
+/// every Android game runs on, and they are faster than ANGLE's ES-on-Vulkan
+/// translation (no shader re-translation, no staging copies for client-side
+/// vertex arrays, cheaper draw submission). So `--gl-driver=auto` keeps ANGLE
+/// for apps that may use ES 1.1 (and for the app picker, whose UI is ES 1.1)
+/// but uses the native driver for apps whose executable only imports ES 2.0
+/// shader entry points.
+///
+/// The app picker's window and the app's window are separate SDL windows, and
+/// SDL unloads the EGL/GLES libraries when the last GL window is destroyed, so
+/// the choice can differ between the two: the variables are simply set (or
+/// cleared again) before each window is created.
+///
+/// This is deliberately conservative:
+/// - It never overrides an `SDL_VIDEO_*_DRIVER` value the user set themselves
+///   (only values this function set earlier are cleared again).
+/// - It only selects ANGLE if *both* libraries can actually be `dlopen`ed, so
+///   a build that doesn't bundle ANGLE is completely unaffected (SDL falls back
+///   to the system driver, which itself may already be ANGLE on Android 15+ or
+///   when the user enabled ANGLE Preferences).
+#[cfg(target_os = "android")]
+fn select_android_gl_driver(
+    preference: crate::options::GlDriverPreference,
+    app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
+) {
+    use crate::options::GlDriverPreference;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether the `SDL_VIDEO_*_DRIVER` variables currently in the environment
+    /// were set by this function (as opposed to by the user).
+    static ANGLE_ENV_SET_BY_US: AtomicBool = AtomicBool::new(false);
+
+    /// Candidate (EGL, GLESv1_CM, GLESv2) soname triples, most specific first.
+    /// `libGLESv1_CM_angle.so` is what SDL should load for touchHLE's ES 1.1
+    /// contexts (this is how Google's own ANGLE-in-APK setup works); entry
+    /// points for higher versions resolve through ANGLE's `eglGetProcAddress`
+    /// regardless. `libfeature_support_angle.so` is dlopened by
+    /// `libGLESv2_angle.so` at runtime, so it must be packaged alongside.
+    const CANDIDATES: &[(&str, &str, &str)] = &[
+        (
+            "libEGL_angle.so",
+            "libGLESv1_CM_angle.so",
+            "libGLESv2_angle.so",
+        ),
+        (
+            "libEGL_angle_in_apk.so",
+            "libGLESv1_CM_angle_in_apk.so",
+            "libGLESv2_angle_in_apk.so",
+        ),
+    ];
+
+    /// Returns true if `name` can be dynamically loaded (i.e. it is present in
+    /// the app's native library search path), closing the handle again.
+    fn can_load(name: &str) -> bool {
+        use std::ffi::CString;
+        let Ok(cname) = CString::new(name) else {
+            return false;
+        };
+        // RTLD_NOW = 2. Load, and immediately unload if it succeeded.
+        unsafe {
+            let handle = libc::dlopen(cname.as_ptr(), 2);
+            if handle.is_null() {
+                false
+            } else {
+                libc::dlclose(handle);
+                true
+            }
+        }
+    }
+
+    fn use_system_driver(reason: &str) {
+        if ANGLE_ENV_SET_BY_US.swap(false, Ordering::Relaxed) {
+            env::remove_var("SDL_VIDEO_EGL_DRIVER");
+            env::remove_var("SDL_VIDEO_GL_DRIVER");
+        }
+        log!(
+            "Using the system OpenGL ES driver rather than bundled ANGLE: {}.",
+            reason
+        );
+    }
+
+    // Respect an explicit user override completely.
+    if env::var_os("TOUCHHLE_ANGLE")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        use_system_driver("TOUCHHLE_ANGLE=0");
+        return;
+    }
+    if !ANGLE_ENV_SET_BY_US.load(Ordering::Relaxed)
+        && (env::var_os("SDL_VIDEO_EGL_DRIVER").is_some()
+            || env::var_os("SDL_VIDEO_GL_DRIVER").is_some())
+    {
+        log!(
+            "SDL_VIDEO_EGL_DRIVER / SDL_VIDEO_GL_DRIVER already set; \
+             leaving GL driver selection to the environment."
+        );
+        return;
+    }
+
+    match preference {
+        GlDriverPreference::Angle => {}
+        GlDriverPreference::Native => {
+            use_system_driver("--gl-driver=native");
+            return;
+        }
+        GlDriverPreference::Auto => {
+            if app_gles_usage.is_some_and(|usage| usage.is_es2_only()) {
+                use_system_driver(
+                    "the app only imports OpenGL ES 2.0 shader entry points, and the \
+                     vendor's native ES 2.0 driver is faster than ES-on-Vulkan \
+                     translation (use --gl-driver=angle to override)",
+                );
+                return;
+            }
+            // App picker, or an app that (also) uses the ES 1.1 fixed-function
+            // pipeline: the vendor's native ES 1.1 path is the risky one, so
+            // ANGLE stays preferred.
+        }
+    }
+
+    for &(egl, gles1, gles2) in CANDIDATES {
+        let loadable = can_load(egl) && can_load(gles1) && can_load(gles2);
+        if !loadable {
+            log_dbg!(
+                "Bundled ANGLE candidate not fully loadable \
+                 (egl={} gles1={} gles2={}); letting SDL use the system driver.",
+                egl,
+                gles1,
+                gles2
+            );
+            continue;
+        }
+        // Set before any SDL video init reads these variables; we are still
+        // single-threaded during Window::new startup here.
+        env::set_var("SDL_VIDEO_EGL_DRIVER", egl);
+        // Point SDL's GL loader at ANGLE's ES 1.1 front-end, as in Google's
+        // own ANGLE-in-APK setup.
+        env::set_var("SDL_VIDEO_GL_DRIVER", gles1);
+        ANGLE_ENV_SET_BY_US.store(true, Ordering::Relaxed);
+        log!(
+            "Bundled ANGLE detected ({} / {} / {}); preferring it over the \
+             system OpenGL ES driver to avoid Adreno ES 1.1 black-screen issues.",
+            egl,
+            gles1,
+            gles2
+        );
+        return;
+    }
+    // No bundled ANGLE: fall through and let SDL use the system driver.
+    use_system_driver("no bundled ANGLE libraries were found");
+}
+
 pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
@@ -565,6 +791,12 @@ pub struct Window {
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     host_framebuffer: u32,
+    /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
+    /// OpenGL ES context, captured at window creation. Used to detect the host
+    /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
+    /// native driver such as Qualcomm Adreno) so that driver-specific
+    /// workarounds can be auto-enabled. See [Window::gl_driver_description].
+    gl_driver_description: String,
     splash_image: Option<Image>,
     /// Whether the selected image already targets the startup orientation.
     splash_image_is_orientation_specific: bool,
@@ -586,9 +818,16 @@ pub struct Window {
     text_input_wanted: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
+    gyroscope: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    show_fps_counter: Cell<bool>,
+    fps_frame_count: Cell<u32>,
+    fps_last_log: RefCell<Instant>,
+    /// Host scheduling / power-management hints for the emulator thread
+    /// (Android). Fed once per presented frame from [Window::swap_window].
+    perf_hints: crate::perf_hints::PerfHints,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -633,12 +872,25 @@ impl Window {
         }
     }
 
+    /// Create the window. `app_gles_usage` describes which OpenGL ES API
+    /// generations the app's executable imports (`None` for the app picker);
+    /// on Android it steers the host GL driver choice, see
+    /// [select_android_gl_driver].
     pub fn new(
         title: &str,
         icon: Option<Image>,
         launch_image: Option<(Image, bool)>,
         options: &Options,
+        app_gles_usage: Option<crate::mach_o::GlesApiUsage>,
     ) -> Window {
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app_gles_usage;
+            if options.gl_driver != crate::options::GlDriverPreference::Auto {
+                log!("--gl-driver= only has an effect on Android; ignoring it.");
+            }
+        }
+
         let sdl_ctx = sdl2::init().unwrap();
         let video_ctx = sdl_ctx.video().unwrap();
 
@@ -658,6 +910,25 @@ impl Window {
 
             // Disable blocking of event loop when app is paused.
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
+
+            // Pick the host OpenGL ES driver: Google's ANGLE (OpenGL ES over
+            // Vulkan, bundled with this build) for apps that may use the
+            // OpenGL ES 1.1 fixed-function pipeline, which the vendors' native
+            // ES 1.1 drivers (Qualcomm Adreno's in particular) get wrong in
+            // black-screen-inducing ways, and the vendor's native driver for
+            // OpenGL ES 2.0-only apps, where it is the faster of the two.
+            //
+            // SDL loads its EGL / GLES libraries with `dlopen`, honouring the
+            // `SDL_VIDEO_EGL_DRIVER` / `SDL_VIDEO_GL_DRIVER` environment
+            // variables (see SDL's `src/video/SDL_egl.c`). If this build was
+            // packaged with ANGLE's `libEGL`/`libGLESv2` in the APK's native
+            // library directory, we point SDL straight at them so ANGLE is used
+            // transparently without the user having to toggle developer
+            // options. When ANGLE isn't bundled this is a no-op and SDL falls
+            // back to the system driver (which itself may already be ANGLE on
+            // Android 15+ or when selected via ANGLE Preferences).
+            #[cfg(target_os = "android")]
+            select_android_gl_driver(options.gl_driver, app_gles_usage);
         }
 
         // Separate mouse and touch events in both SDL synthesis directions.
@@ -672,6 +943,19 @@ impl Window {
         // here, and then the app can disable it if it wants to.
         video_ctx.enable_screen_saver();
 
+        // PERF: never request depth or stencil buffers for the window's own
+        // framebuffer. The only things ever drawn to it are flat,
+        // depth-untested textured quads (app presentation, splash screen, app
+        // picker); the guest app itself renders into offscreen renderbuffers
+        // with their own attachments. On tile-based mobile GPUs, skipping the
+        // window depth/stencil buffers saves memory bandwidth on every swap
+        // chain resolution. Note: must be set *before* window creation.
+        {
+            let attr = video_ctx.gl_attr();
+            attr.set_depth_size(0);
+            attr.set_stencil_size(0);
+        }
+
         let scale_hack = options.scale_hack;
         let host_screen_size = options.host_screen_size.map(normalize_portrait_size);
         // TODO: some apps specify their orientation in Info.plist, we could use
@@ -679,7 +963,8 @@ impl Window {
         let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
         let device_orientation = options.initial_orientation;
         let fullscreen = options.fullscreen;
-        let portrait_screen_size = host_screen_size.unwrap_or_else(|| device_family.portrait_size());
+        let portrait_screen_size =
+            host_screen_size.unwrap_or_else(|| device_family.portrait_size());
 
         let mut window = if Self::rotatable_fullscreen() {
             // Without this, SDL will force fullscreen mode to be portrait.
@@ -702,8 +987,11 @@ impl Window {
                 .unwrap();
             window
         } else {
-            let (width, height) =
-                size_for_orientation_from_size(portrait_screen_size, device_orientation, scale_hack);
+            let (width, height) = size_for_orientation_from_size(
+                portrait_screen_size,
+                device_orientation,
+                scale_hack,
+            );
             let window = video_ctx
                 .window(title, width, height)
                 .position_centered()
@@ -731,17 +1019,50 @@ impl Window {
 
         let sensor_ctx = sdl_ctx.sensor().unwrap();
         let mut accelerometer: Option<sdl2::sensor::Sensor> = None;
+        let mut gyroscope: Option<sdl2::sensor::Sensor> = None;
         if let Ok(num_sensors) = sensor_ctx.num_sensors() {
             for sensor_idx in 0..num_sensors {
+                if accelerometer.is_some() && gyroscope.is_some() {
+                    break;
+                }
                 if let Ok(sensor) = sensor_ctx.open(sensor_idx) {
-                    if sensor.sensor_type() == sdl2::sensor::SensorType::Accelerometer {
-                        log!("Accelerometer detected: {}.", sensor.name());
-                        accelerometer = Some(sensor);
-                        break;
+                    match sensor.sensor_type() {
+                        sdl2::sensor::SensorType::Accelerometer => {
+                            if accelerometer.is_none() {
+                                log!("Accelerometer detected: {}.", sensor.name());
+                                accelerometer = Some(sensor);
+                            }
+                        }
+                        sdl2::sensor::SensorType::Gyroscope
+                        | sdl2::sensor::SensorType::LeftGyroscope
+                        | sdl2::sensor::SensorType::RightGyroscope => {
+                            // Gyroscope was previously disabled here under the
+                            // suspicion of a native abort; the real culprit was
+                            // batteryLevel -> SDL_GetPowerInfo -> JNI (see
+                            // get_battery_status cache below), so the sensor is
+                            // back.
+                            if gyroscope.is_none() {
+                                log!("Gyroscope detected: {}.", sensor.name());
+                                gyroscope = Some(sensor);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+
+        // Populate the battery cache here, on the real SDLThread stack: guest
+        // code later calls [UIDevice batteryLevel] from a coroutine stack, and
+        // the JNI calls inside SDL_GetPowerInfo (Android_JNI_GetPowerInfo)
+        // abort ART when made from that context (pending StackOverflowError).
+        populate_battery_cache();
+
+        // Likewise, resolve the WebView overlay bridge's JNI class and
+        // method IDs here: FindClass needs the app class loader, which is
+        // only reachable from this stack before guest code starts running
+        // on a coroutine stack.
+        crate::android_web_view::populate_jni_cache();
 
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
@@ -768,6 +1089,7 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             host_framebuffer: 0,
+            gl_driver_description: String::new(),
             splash_image,
             splash_image_is_orientation_specific,
             device_family,
@@ -786,9 +1108,21 @@ impl Window {
             text_input_wanted: false,
             _sensor_ctx: sensor_ctx,
             accelerometer,
+            gyroscope,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
+            show_fps_counter: Cell::new(false),
+            fps_frame_count: Cell::new(0),
+            fps_last_log: RefCell::new(Instant::now()),
+            perf_hints: crate::perf_hints::PerfHints::new(
+                options.perf_hints,
+                options
+                    .fps_limit
+                    .map(|fps| Duration::from_secs_f64(1.0 / fps))
+                    .unwrap_or(Duration::from_micros(16_667)),
+                options.affinity.as_deref(),
+            ),
             on_main_stack: true,
         };
 
@@ -801,9 +1135,14 @@ impl Window {
         } else {
             create_gles1_ctx_no_parent_stack(&mut window, options)
         };
+        if options.trace_gl_errors {
+            gl_ins = Box::new(LoggingGLESContext {
+                inner: gl_ins,
+                verbose: options.trace_gl_errors || options.verbose_gles,
+            });
+        }
         let host_framebuffer = {
             let mut gl_ctx = gl_ins.make_current(&mut window);
-            log!("Driver info: {}", unsafe { gl_ctx.driver_description() });
             if env::consts::OS == "ios" {
                 let mut framebuffer = 0;
                 unsafe {
@@ -830,13 +1169,117 @@ impl Window {
                 drawable_height,
             );
         }
+        let gl_driver_description = {
+            let gl_ctx = gl_ins.make_current(&mut window);
+            unsafe { gl_ctx.driver_description() }
+        };
+        log!("Driver info: {}", gl_driver_description);
+        window.gl_driver_description = gl_driver_description;
         window.internal_gl_ins = Some(gl_ins);
+
+        // Swap interval. EGL's swap interval is a property of the window
+        // surface, which every context created for this window shares, so
+        // setting it once here (with the internal context current) covers the
+        // app's EAGL contexts too.
+        //
+        // On Android the default (1, i.e. vsync) is a poor fit: the emulator
+        // already paces frames itself (`--fps-limit`, on by default) and the
+        // Android compositor synchronises to the display regardless, so a
+        // blocking swap can't prevent tearing, it can only stall the emulator
+        // thread — and a stall on top of a frame that already took nearly a
+        // refresh interval turns "almost 60 FPS" into a hard 30 FPS. Desktop
+        // drivers are left at their default unless asked otherwise.
+        let swap_interval = match options.vsync {
+            crate::options::VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
+            crate::options::VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
+            crate::options::VsyncMode::Auto => {
+                if env::consts::OS == "android" {
+                    Some(sdl2::video::SwapInterval::Immediate)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(swap_interval) = swap_interval {
+            let vsync_on = matches!(swap_interval, sdl2::video::SwapInterval::VSync);
+            match window.video_ctx.gl_set_swap_interval(swap_interval) {
+                Ok(()) => log!(
+                    "Vsync {} (swap interval {}).",
+                    if vsync_on { "enabled" } else { "disabled" },
+                    if vsync_on { 1 } else { 0 }
+                ),
+                Err(e) => log!(
+                    "Warning: could not {} vsync, leaving the driver's default swap interval: {}",
+                    if vsync_on { "enable" } else { "disable" },
+                    e
+                ),
+            }
+        }
+
+        // Detect the host GL stack once, up front, so we can auto-apply the
+        // known Adreno black-screen workarounds. On Qualcomm Adreno hardware,
+        // the native OpenGL ES 1.1 driver is unusually strict: it samples
+        // incomplete textures as opaque black and silently stubs ES 2.0-style
+        // shader entry points requested through an ES 1.1 context, both of
+        // which manifest as a black screen for many early iPhone OS games.
+        // Google's ANGLE (OpenGL ES over Vulkan) is far more lenient and is the
+        // recommended driver on modern Adreno devices — the manifest opt-in and
+        // the SDL_VIDEO_GL_DRIVER hook let ANGLE be selected transparently, and
+        // when it is, `driver_description()` reports an "ANGLE" renderer here.
+        window.log_gpu_backend_hints();
 
         if window.splash_image.is_some() {
             window.display_splash();
         }
 
         window
+    }
+
+    /// Whether the host OpenGL stack is Google's ANGLE (OpenGL ES translated to
+    /// Vulkan/Direct3D/Metal) rather than a vendor-native driver. Detected from
+    /// the `GL_VERSION` / `GL_RENDERER` strings captured at context creation.
+    pub fn is_angle_backend(&self) -> bool {
+        self.gl_driver_description.contains("ANGLE")
+    }
+
+    /// Whether the host GPU is a Qualcomm Adreno part. Used to decide whether
+    /// the Adreno-specific rendering workarounds should be auto-enabled.
+    pub fn is_adreno_gpu(&self) -> bool {
+        let d = &self.gl_driver_description;
+        d.contains("Adreno") || d.contains("Qualcomm")
+    }
+
+    /// The cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string for the internal
+    /// OpenGL ES context.
+    #[allow(dead_code)]
+    pub fn gl_driver_description(&self) -> &str {
+        &self.gl_driver_description
+    }
+
+    /// Log a one-line summary of the detected GPU backend and, on Adreno
+    /// hardware, whether ANGLE is active. This makes the "black screen on
+    /// Adreno" situation diagnosable straight from the log the user shares.
+    fn log_gpu_backend_hints(&self) {
+        if self.is_adreno_gpu() {
+            if self.is_angle_backend() {
+                log!(
+                    "GPU backend: Qualcomm Adreno via ANGLE (recommended). \
+                     ANGLE's lenient ES emulation avoids the native Adreno \
+                     driver's black-screen issues."
+                );
+            } else {
+                log!(
+                    "GPU backend: Qualcomm Adreno native OpenGL ES driver. \
+                     Its ES 2.0 path is the fast one and is what OpenGL ES \
+                     2.0-only apps are given on purpose (see --gl-driver); its \
+                     ES 1.1 path is strict and can render some early iPhone OS \
+                     games as a black screen, so if this app uses ES 1.1 and \
+                     comes out black, try --gl-driver=angle. The Adreno \
+                     rendering workarounds (--fix-texture-min-filter) are \
+                     auto-enabled to mitigate this."
+                );
+            }
+        }
     }
 
     /// Poll for events from the OS. This needs to be done reasonably often
@@ -909,8 +1352,11 @@ impl Window {
             // 320x480 UIKit space so EAGLView still receives the event; a
             // separate UITouch locationInView compatibility path can remap
             // the coordinates returned to the game.
-            let [x, y] = if std::env::var_os("TOUCHHLE_DISABLE_PRESENT_ROTATION").is_some()
-                || std::env::var_os("TOUCHHLE_DISABLE_TOUCH_ROTATION").is_some()
+            // PERF: cache the read-once debug toggles; this runs per SDL
+            // touch event, and each std::env::var_os is a global-lock environ
+            // scan with allocation.
+            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+                || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
                 log_once!(
                     "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
@@ -928,12 +1374,12 @@ impl Window {
 
             // Optional hit-test tuning only. Do not use these unless you are
             // deliberately testing the UIKit hit-test position.
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_X_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_X_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_x += offset;
                 }
             }
-            if let Ok(offset) = std::env::var("TOUCHHLE_HITTEST_Y_OFFSET") {
+            if let Some(offset) = crate::env_var_cached!("TOUCHHLE_HITTEST_Y_OFFSET") {
                 if let Ok(offset) = offset.parse::<f32>() {
                     out_y += offset;
                 }
@@ -1229,24 +1675,29 @@ impl Window {
                     }
                 }
                 E::AppWillEnterBackground { .. } => {
-                    if cfg!(target_os = "ios") {
-                        log!("Received app-will-resign-active event; allowing iOS to suspend and resume the host.");
-                        continue;
-                    }
-                    log!("Received app-will-resign-active event.");
-                    assert!(self.high_priority_event.is_none());
-                    self.high_priority_event = Some(Event::AppWillResignActive);
-                    // For some reason, if we don't pause event polling, we will
-                    // never finish handling the event.
-                    // TODO: Add a mechanism for re-enabling polling, if at some
-                    // point we support returning touchHLE to the foreground.
-                    self.enable_event_polling = false;
-                    continue;
+                    log_dbg!("Received app-will-resign-active event.");
+                    Event::AppWillResignActive
+                }
+                E::AppDidEnterBackground { .. } => {
+                    log_dbg!("Received app-did-enter-background event.");
+                    Event::AppDidEnterBackground
+                }
+                E::AppWillEnterForeground { .. } => {
+                    log_dbg!("Received app-will-enter-foreground event.");
+                    Event::AppWillEnterForeground
+                }
+                E::AppDidEnterForeground { .. } => {
+                    log_dbg!("Received app-did-become-active event.");
+                    Event::AppDidBecomeActive
                 }
                 E::AppTerminating { .. } => {
-                    log!("Received app-will-terminate event.");
+                    log_dbg!("Received app-will-terminate event.");
                     assert!(self.high_priority_event.is_none());
                     self.high_priority_event = Some(Event::AppWillTerminate);
+                    // App is about to be killed by the OS. Stop polling so we
+                    // can return to the run loop and dispatch the high
+                    // priority event quickly, before the process is
+                    // terminated.
                     self.enable_event_polling = false;
                     continue;
                 }
@@ -1279,9 +1730,24 @@ impl Window {
                     // TODO: handle out of order touches
                     let curr_timestamp = timestamp;
                     let abs_coords = finger_absolute_coords(self, (x, y));
+                    // The trainer overlay (Cheat Engine-style) gets first
+                    // dibs on touches that land on its button or panel.
+                    let trainer_consumed = match event {
+                        E::FingerDown { .. } => {
+                            crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                        }
+                        E::FingerUp { .. } => {
+                            crate::trainer_ui::touch_up(abs_coords, self.viewport())
+                        }
+                        _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
+                    };
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
-                    let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
+                    let mut map = if trainer_consumed {
+                        HashMap::new()
+                    } else {
+                        HashMap::from([(FingerId::Touch(finger_id), coords)])
+                    };
                     while let Some(next) = self.event_pump.poll_event() {
                         match next {
                             E::Unknown { .. } => (),
@@ -1310,8 +1776,21 @@ impl Window {
                                 ..
                             } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
                                 let abs_coords = finger_absolute_coords(self, (x, y));
+                                let trainer_consumed = match next {
+                                    E::FingerDown { .. } => {
+                                        crate::trainer_ui::touch_down(abs_coords, self.viewport())
+                                    }
+                                    E::FingerUp { .. } => {
+                                        crate::trainer_ui::touch_up(abs_coords, self.viewport())
+                                    }
+                                    _ => {
+                                        crate::trainer_ui::touch_motion(abs_coords, self.viewport())
+                                    }
+                                };
                                 let coords = transform_input_coords(self, abs_coords, false);
-                                map.insert(FingerId::Touch(finger_id), coords);
+                                if !trainer_consumed {
+                                    map.insert(FingerId::Touch(finger_id), coords);
+                                }
                             }
                             E::MultiGesture { timestamp, .. } if timestamp == curr_timestamp => {
                                 // TODO: handle gestures
@@ -1359,6 +1838,28 @@ impl Window {
                     .intersects(sdl2::keyboard::Mod::LALTMOD | sdl2::keyboard::Mod::RALTMOD) =>
                 {
                     self.toggle_fullscreen();
+                    continue;
+                }
+                // Toggle FPS counter with F9
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F10),
+                    repeat: false,
+                    ..
+                } => {
+                    // This is a hack for the user: we can't easily modify Options
+                    // while the environment is running without some synchronization,
+                    // but for debugging we can just log that the key was pressed.
+                    // Actually, if we want to toggle it, we need access to env.options.
+                    echo!("F10 pressed: Toggle Verbose GLES (requires env.options access)");
+                    continue;
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    ..
+                } => {
+                    let new = !self.show_fps_counter.get();
+                    self.set_show_fps_counter(new);
+                    echo!("FPS counter {}", if new { "enabled" } else { "disabled" });
                     continue;
                 }
                 E::KeyDown {
@@ -1505,7 +2006,7 @@ impl Window {
                 // SDL2 reports acceleration in units of m/s^2.
                 let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
                 let (x, y, z) = (x / gravity, y / gravity, z / gravity);
-                return (x, y, z);
+                return accelerometer_compat_remap(x, y, z);
             }
         }
 
@@ -1551,6 +2052,34 @@ impl Window {
         let [x, y, z] = matrix.transform(gravity);
 
         (x, y, z)
+    }
+
+    /// Returns [true] if the host device provides a gyroscope sensor.
+    pub fn has_gyroscope(&self) -> bool {
+        self.gyroscope.is_some()
+    }
+
+    /// Get the host gyroscope rotation rate, in radians per second, in the
+    /// device coordinate frame (+x right of the screen, +y top of the screen,
+    /// +z away from the screen), matching the axes of CMRotationRate.
+    /// SDL reports gyroscope data in radians per second relative to the
+    /// device axes, so no unit or axis conversion is needed.
+    /// See also [crate::frameworks::core_motion].
+    pub fn get_rotation_rate(&self) -> Option<(f32, f32, f32)> {
+        let gyroscope = self.gyroscope.as_ref()?;
+        let data = gyroscope.get_data().ok()?;
+        let sdl2::sensor::SensorData::Gyro(data) = data else {
+            // We asked SDL for the gyroscope sensor explicitly earlier; if
+            // SDL handed us a different sensor variant (driver bug, future
+            // SDL version, etc.), treat the sensor as unavailable.
+            log!(
+                "Warning: gyroscope sensor returned non-Gyro data ({:?}); ignoring.",
+                data
+            );
+            return None;
+        };
+        let [x, y, z] = data;
+        Some((x, y, z))
     }
 
     /// For use when redrawing the screen: Get the cached on-screen position and
@@ -1849,8 +2378,41 @@ impl Window {
 
     /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
     /// presented.
-    pub fn swap_window(&self) {
+    pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
+        self.perf_hints.frame_presented();
+
+        // FPS logging / UI: count frames and print once per second if enabled.
+        if self.show_fps_counter.get() {
+            // Increment frame count.
+            let frames = self.fps_frame_count.get().saturating_add(1);
+            self.fps_frame_count.set(frames);
+
+            let now = Instant::now();
+            // Borrow last log time
+            let mut last = self.fps_last_log.borrow_mut();
+            let elapsed = now.duration_since(*last);
+            if elapsed >= Duration::from_secs(1) {
+                // Compute FPS (frames in elapsed duration)
+                let fps = (frames as f32) / (elapsed.as_secs_f32().max(1e-6));
+                // Log to stdout / echo
+                echo!("FPS: {:.1}", fps);
+                // Reset counters
+                *last = now;
+                self.fps_frame_count.set(0);
+
+                // Also show FPS in the window title so it's visible when the
+                // app is running fullscreen or without console.
+                let base_title = if crate::branding().is_empty() {
+                    format!("touchHLE {}", crate::VERSION)
+                } else {
+                    format!("touchHLE {} {}", crate::branding(), crate::VERSION)
+                };
+                let title = format!("{} - FPS: {:.1}", base_title, fps);
+                // Ignore any error setting the title.
+                let _ = self.window.set_title(&title);
+            }
+        }
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.
@@ -1971,8 +2533,11 @@ impl Window {
     /// The aspect ratio of this region always reflects the guest app's view of
     /// the world, but the scale and orientation might not.
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
-        let (app_width, app_height) =
-            size_for_orientation_from_size(self.screen_size(), self.device_orientation, self.scale_hack);
+        let (app_width, app_height) = size_for_orientation_from_size(
+            self.screen_size(),
+            self.device_orientation,
+            self.scale_hack,
+        );
         if !self.fullscreen && !Self::rotatable_fullscreen() {
             return (0, 0, app_width, app_height);
         }
@@ -1999,6 +2564,56 @@ impl Window {
 
     pub fn host_framebuffer(&self) -> u32 {
         self.host_framebuffer
+    }
+
+    /// Map a guest-space `CGRect` (points, possibly rotated/letterboxed) to
+    /// host window pixels `(x, y, w, h)` for host-side overlays (native
+    /// Android webviews etc.). Returns `w`/`h` of 0 when nothing is visible.
+    pub fn guest_frame_to_window_px(
+        &self,
+        frame: crate::frameworks::core_graphics::CGRect,
+    ) -> (i32, i32, i32, i32) {
+        let (vp_x, vp_y, vp_w, vp_h) = self.viewport();
+        let (app_w, app_h) = self.size_unrotated_unscaled();
+        let (app_w, app_h) = (app_w as f32, app_h as f32);
+        if app_w <= 0.0 || app_h <= 0.0 || vp_w == 0 || vp_h == 0 {
+            return (0, 0, 0, 0);
+        }
+        let sx = vp_w as f32 / app_w;
+        let sy = vp_h as f32 / app_h;
+        // Rotate the guest rect into the device orientation, then scale to
+        // viewport pixels (mirrors the composition rotation).
+        let (x, y, w, h) = match self.device_orientation {
+            crate::window::DeviceOrientation::Portrait => (
+                frame.origin.x as f32,
+                frame.origin.y as f32,
+                frame.size.width as f32,
+                frame.size.height as f32,
+            ),
+            crate::window::DeviceOrientation::PortraitUpsideDown => (
+                app_w - frame.origin.x as f32 - frame.size.width as f32,
+                app_h - frame.origin.y as f32 - frame.size.height as f32,
+                frame.size.width as f32,
+                frame.size.height as f32,
+            ),
+            crate::window::DeviceOrientation::LandscapeLeft => (
+                frame.origin.y as f32,
+                app_w - frame.origin.x as f32 - frame.size.width as f32,
+                frame.size.height as f32,
+                frame.size.width as f32,
+            ),
+            crate::window::DeviceOrientation::LandscapeRight => (
+                app_h - frame.origin.y as f32 - frame.size.height as f32,
+                frame.origin.x as f32,
+                frame.size.height as f32,
+                frame.size.width as f32,
+            ),
+        };
+        let px = (vp_x as f32 + x * sx).round() as i32;
+        let py = (vp_y as f32 + y * sy).round() as i32;
+        let pw = (w * sx).round() as i32;
+        let ph = (h * sy).round() as i32;
+        (px, py, pw.max(0), ph.max(0))
     }
 
     /// Special offset to add to y co-ordinates, only when drawing to screen.
@@ -2061,10 +2676,74 @@ impl Window {
     pub fn on_main_stack(&self) -> bool {
         self.on_main_stack
     }
+
+    /// Toggle FPS counter at runtime.
+    pub fn set_show_fps_counter(&mut self, enabled: bool) {
+        self.show_fps_counter.set(enabled);
+        // Also enable the on-screen FPS overlay so runtime toggles apply to
+        // the graphical overlay as well as the window title/console logging.
+        crate::gles::present::set_onscreen_fps_enabled(enabled);
+    }
 }
 
 pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
+    // On Android prefer our own JNI path to the system browser: SDL's
+    // SDL_OpenURL goes through SDLActivity.openURL, which works, but doing
+    // it directly keeps the intent flags predictable and avoids issues when
+    // the app process is paused on return. Non-Android platforms keep using
+    // SDL_OpenURL (desktop shell handlers).
+    #[cfg(target_os = "android")]
+    {
+        if crate::android_web_view::open_url_external(url) {
+            return Ok(());
+        }
+    }
     env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
+}
+
+/// SDL COMMAND_USER value used to ask MainActivity to open the system file
+/// picker for adding an .ipa file. Must be >= 0x8000 (see SDLActivity.java).
+#[cfg(target_os = "android")]
+const ADD_IPA_COMMAND: u32 = 0x8000;
+
+// SDL_AndroidSendMessage is only available in SDL builds for Android.
+#[cfg(target_os = "android")]
+extern "C" {
+    fn SDL_AndroidSendMessage(command: u32, param: i32) -> i32;
+}
+
+/// Ask the Java side to open the system file picker for adding an .ipa file
+/// (see MainActivity.onUnhandledMessage). On other platforms, fall back to
+/// opening the apps directory in the file manager.
+///
+/// Unlike [open_url], this never opens a URL, so it is safe to call from the
+/// app picker without risking a failed system intent.
+pub fn launch_ipa_picker(env: &mut Environment) -> Result<(), String> {
+    // Like other SDL calls from the app picker, this must run on the main
+    // stack (see on_parent_stack_in_coroutine), otherwise Android can
+    // misbehave or crash.
+    let result = env.on_parent_stack_in_coroutine(|_, _| {
+        #[cfg(target_os = "android")]
+        {
+            unsafe { SDL_AndroidSendMessage(ADD_IPA_COMMAND, 0) }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            -1
+        }
+    });
+    if result == 0 {
+        return Ok(());
+    }
+    // Fall back to opening the apps directory in the file manager, so a
+    // .ipa file can still be added manually.
+    match crate::paths::url_for_opening_apps_dir() {
+        Ok(url) => open_url(env, &url),
+        Err(e) => Err(format!(
+            "SDL_AndroidSendMessage returned {result}, and opening the \
+             apps directory failed too: {e}"
+        )),
+    }
 }
 
 /// Show an SDL messagebox for an error (typically after a panic).
@@ -2136,7 +2815,38 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
 /// - pct: i32 - percentage of battery remaining.
 /// - status: [BatteryState] - the current status of the battery
 ///   (unplugged, charging, full, etc.)
+/// Battery state cached once at window creation. Guest code runs on a
+/// coroutine stack where JNI calls abort on Android (see populate_battery_cache),
+/// so [UIDevice batteryLevel] must never reach SDL_GetPowerInfo directly.
+static BATTERY_CACHE: std::sync::OnceLock<(i32, BatteryState)> = std::sync::OnceLock::new();
+
+/// Read the battery once, from the real SDLThread stack. JNI (Android) is only
+/// safe here — this runs before guest emulation starts on a coroutine stack.
+pub fn populate_battery_cache() {
+    let mut pct = 0;
+    let status = unsafe { sdl2_sys::SDL_GetPowerInfo(null_mut(), &mut pct) };
+    let state = match status {
+        SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
+        SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
+        SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
+        SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
+        SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
+    };
+    let _ = BATTERY_CACHE.set((pct, state));
+}
+
 pub fn get_battery_status() -> (i32, BatteryState) {
+    if let Some(&(pct, ref state)) = BATTERY_CACHE.get() {
+        let state = match *state {
+            BatteryState::Unknown => BatteryState::Unknown,
+            BatteryState::OnBattery => BatteryState::OnBattery,
+            BatteryState::NoBattery => BatteryState::NoBattery,
+            BatteryState::Charging => BatteryState::Charging,
+            BatteryState::Full => BatteryState::Full,
+        };
+        return (pct, state);
+    }
+    // Not cached yet (headless/window-less use): query directly.
     let mut pct = 0;
     // Unfortunately, Rust-SDL2 does not expose this function yet.
     // iPhoneOS does not measure the battery in seconds remaining,

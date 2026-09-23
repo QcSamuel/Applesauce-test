@@ -16,29 +16,39 @@ pub mod ui_switch;
 pub mod ui_text_field;
 
 use crate::frameworks::core_graphics::CGPoint;
-use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
+use crate::frameworks::uikit::ui_application;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
-    retain, ClassExports, NSZonePtr, SEL,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil, objc_classes,
+    release, retain, ClassExports, NSZonePtr, SEL,
 };
 use crate::Environment;
 
-// TODO: There are many members of this enum missing.
 pub type UIControlEvents = NSUInteger;
 const UIControlEventTouchDown: UIControlEvents = 1 << 0;
+const UIControlEventTouchDownRepeat: UIControlEvents = 1 << 1;
 const UIControlEventTouchDragInside: UIControlEvents = 1 << 2;
 const UIControlEventTouchDragOutside: UIControlEvents = 1 << 3;
 const UIControlEventTouchDragEnter: UIControlEvents = 1 << 4;
 const UIControlEventTouchDragExit: UIControlEvents = 1 << 5;
 pub const UIControlEventTouchUpInside: UIControlEvents = 1 << 6;
 const UIControlEventTouchUpOutside: UIControlEvents = 1 << 7;
+const UIControlEventTouchCancel: UIControlEvents = 1 << 8;
 pub const UIControlEventValueChanged: UIControlEvents = 1 << 12;
+pub const UIControlEventEditingDidBegin: UIControlEvents = 1 << 16;
+pub const UIControlEventEditingChanged: UIControlEvents = 1 << 17;
+pub const UIControlEventEditingDidEnd: UIControlEvents = 1 << 18;
+const UIControlEventEditingDidEndOnExit: UIControlEvents = 1 << 19;
+
+pub type UIControlContentVerticalAlignment = NSInteger;
+const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment = 0;
 
 pub struct UIControlHostObject {
     superclass: super::UIViewHostObject,
     enabled: bool,
     selected: bool,
     highlighted: bool,
+    content_vertical_alignment: UIControlContentVerticalAlignment,
     /// `UITouch*` of the touch currently being tracked, [nil] if none
     tracked_touch: id,
     tracking: bool,
@@ -54,6 +64,7 @@ impl Default for UIControlHostObject {
             enabled: true,
             selected: false,
             highlighted: false,
+            content_vertical_alignment: UIControlContentVerticalAlignmentCenter,
             tracked_touch: nil,
             tracking: false,
             action_targets: Vec::new(),
@@ -86,10 +97,9 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
         );
     }
 
+    let application: id = msg_class![env; UIApplication sharedApplication];
     for (target, action) in action_targets {
-        assert!(target != nil); // TODO
-
-        () = msg![env; this sendAction:action to:target forEvent:event];
+        () = msg![env; application sendAction:action to:target from:this forEvent:event];
     }
 }
 
@@ -111,6 +121,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         enabled: _,
         selected: _,
         highlighted: _,
+        content_vertical_alignment: _,
         tracking: _,
         action_targets: _, // targets are weak references, nothing to do
         tracked_touch,
@@ -161,6 +172,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setHighlighted:(bool)highlighted {
     env.objc.borrow_mut::<UIControlHostObject>(this).highlighted = highlighted;
+}
+
+- (NSInteger)contentVerticalAlignment {
+    env.objc.borrow::<UIControlHostObject>(this).content_vertical_alignment
+}
+
+- (())setContentVerticalAlignment:(UIControlContentVerticalAlignment)alignment {
+    env.objc.borrow_mut::<UIControlHostObject>(this).content_vertical_alignment = alignment;
 }
 
 - (bool)tracking {
@@ -269,26 +288,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     });
 }
 
+- (())touchesCancelled:(id)touches withEvent:(id)event {
+    let tracked = env.objc.borrow::<UIControlHostObject>(this).tracked_touch;
+    if tracked == nil { return; }
+    let contains: bool = msg![env; touches containsObject:tracked];
+    if !contains { return; }
+    let host = env.objc.borrow_mut::<UIControlHostObject>(this);
+    host.tracked_touch = nil;
+    host.tracking = false;
+    () = msg![env; this cancelTrackingWithEvent:event];
+    () = msg![env; this setHighlighted:false];
+    send_actions(env, this, event, UIControlEventTouchCancel);
+    release(env, tracked);
+}
+
 - (())addTarget:(id)target
          action:(SEL)action
 forControlEvents:(UIControlEvents)events {
-    if target == nil {
-        // TODO: when the target is nil, the responder chain is searched for
-        // a suitable target
+    // A nil target is intentional: UIApplication resolves the action through
+    // the sender's responder chain when the control event is delivered.
+    // The target is a *weak* reference!
+
+    // The selector must be for a method with zero to two arguments. A
+    // selector with more colons is malformed guest input; log it and ignore
+    // the registration instead of panicking the host.
+    let sel_str = action.as_str(&env.mem);
+    let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
+    if ![0, 1, 2].contains(&colon_count) {
         log!(
-            "TODO: [{:?} addTarget:nil action:{:?} forControlEvents:{:?}] (ignored)",
-            target,
-            action,
-            events,
+            "Warning: addTarget: unsupported selector {:?} ({} colons); ignoring.",
+            sel_str, colon_count
         );
         return;
     }
-    // The target is a *weak* reference!
-
-    // The selector must be for a method with zero to two arguments
-    let sel_str = action.as_str(&env.mem);
-    let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
-    assert!([0, 1, 2].contains(&colon_count));
 
     env.objc.borrow_mut::<UIControlHostObject>(this).action_targets.push((target, action, events));
 }
@@ -296,8 +328,6 @@ forControlEvents:(UIControlEvents)events {
 - (())sendAction:(SEL)action
               to:(id)target
         forEvent:(id)event { // UIEvent*
-    assert!(target != nil); // TODO
-
     let sel_str = action.as_str(&env.mem);
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     match colon_count {

@@ -21,7 +21,7 @@ use crate::frameworks::core_foundation::cf_run_loop::{
 use crate::frameworks::{core_animation, media_player, uikit};
 use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
 use crate::Environment;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// `NSString*`
 pub type NSRunLoopMode = id;
@@ -283,10 +283,13 @@ pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) -
 /// mechanism?
 /// TODO: Handle run loop modes. Currently assumes the common modes.
 pub fn add_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
-    env.objc
+    let queues = &mut env
+        .objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .audio_queues
-        .push(queue);
+        .audio_queues;
+    if !queues.contains(&queue) {
+        queues.push(queue);
+    }
 }
 
 /// For use by Audio Toolbox.
@@ -295,8 +298,9 @@ pub fn remove_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueue
         .objc
         .borrow_mut::<NSRunLoopHostObject>(run_loop)
         .audio_queues;
-    let queue_idx = queues.iter().position(|&item| item == queue).unwrap();
-    queues.remove(queue_idx);
+    if let Some(queue_idx) = queues.iter().position(|&item| item == queue) {
+        queues.remove(queue_idx);
+    }
 }
 
 /// For use by NSTimer so it can remove itself once it's invalidated.
@@ -342,20 +346,6 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
-    if single_iteration {
-        log_dbg!(
-            "Entering run loop {:?} (single iteration), limit {:?}",
-            run_loop,
-            unix_time_limit
-        );
-    } else {
-        log_dbg!(
-            "Entering run loop {:?} (indefinitely), limit {:?}",
-            run_loop,
-            unix_time_limit
-        );
-    }
-
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
@@ -370,12 +360,12 @@ pub fn run_run_loop(
 
     let is_main_run_loop = env.current_thread == 0;
 
-    if is_main_run_loop {
-        // Important breadcrumb for diagnosing "app freezes after splash"
-        // reports: this only fires once, when the main run loop actually
-        // starts iterating, which means UIApplicationMain has finished
-        // applicationDidFinishLaunching: + applicationDidBecomeActive:.
-        log_once!("Main NSRunLoop reached its first iteration (app finished launching)");
+    if is_main_run_loop && !single_iteration {
+        // Diagnostic: everything the app's UI does — event delivery,
+        // composition, timers — is dispatched from this loop. If this line
+        // never appears in the log, the app hung before its run loop ever
+        // started (e.g. somewhere inside applicationDidFinishLaunching).
+        log_once!("Main run loop: now dispatching events, timers and composition");
     }
 
     loop {
@@ -407,7 +397,9 @@ pub fn run_run_loop(
 
         for timer in timers_tmp.drain(..) {
             let next_due = ns_timer::handle_timer(env, timer);
-            limit_sleep_time(&mut sleep_until, next_due);
+            // Timer deadlines are virtual; audio/UI deadlines remain real.
+            let host_due = next_due.map(|due| env.guest_clock.host_deadline(due));
+            limit_sleep_time(&mut sleep_until, host_due);
             release(env, timer);
         }
 
@@ -478,12 +470,13 @@ pub fn run_run_loop(
             // (Apple's epoch is less convenient in Rust. And "pure"
             // Rust approach with Duration/Instant is just too troublesome
             // and not worthy to convert back and forth)
-            if SystemTime::now()
+            // The host clock could be set before the Unix epoch (or skew
+            // backwards); never panic on that, just treat it as "not yet".
+            let now_secs = env.guest_clock.system_time()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-                >= limit
-            {
+                .unwrap_or_default()
+                .as_secs_f64();
+            if now_secs >= limit {
                 break;
             }
         }

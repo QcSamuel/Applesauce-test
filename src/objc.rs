@@ -23,7 +23,7 @@ use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant, HostDylib,
 };
 use crate::MutexId;
-use std::collections::{HashMap, HashSet};
+use crate::fastmap::{FxHashMap, FxHashSet};
 
 mod classes;
 mod messages;
@@ -35,23 +35,22 @@ mod synchronization;
 mod weak;
 
 pub use classes::{
-    class_addMethod, class_copyIvarList, class_copyMethodList, class_copyPropertyList,
-    class_copyProtocolList, class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
-    class_getMethodImplementation, class_getMethodImplementation_stret, class_getName,
-    class_getProperty, class_getSuperclass, class_replaceMethod, class_respondsToSelector, class_setSuperclass,
-    method_exchangeImplementations,
+    __objc_deallocOnMainThreadHelper, class_addMethod, class_copyIvarList, class_copyMethodList,
+    class_copyPropertyList, class_copyProtocolList, class_getClassMethod, class_getInstanceMethod,
+    class_getInstanceSize, class_getMethodImplementation, class_getMethodImplementation_stret,
+    class_isMetaClass, class_getName, class_getProperty, class_getSuperclass, class_replaceMethod,
+    class_respondsToSelector, class_setSuperclass, method_exchangeImplementations,
     method_getImplementation, method_getName, method_getTypeEncoding, method_setImplementation,
-    objc_storeStrong,
-    objc_alloc, objc_allocWithZone, objc_allocateClassPair, objc_autorelease, objc_autoreleasePoolPop,
-    swift_getInitializedObjCClass,
-    objc_autoreleasePoolPush, objc_autoreleaseReturnValue, objc_begin_catch, objc_classes,
-    objc_copyClassNamesForImage, objc_disposeClassPair, objc_end_catch, objc_exception_throw,
-    objc_getClass, objc_getMetaClass, objc_getProtocol, objc_getRequiredClass, objc_lookUpClass,
-    objc_readClassPair, objc_registerClassPair,
-    objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
-    objc_retainBlock, __objc_deallocOnMainThreadHelper,
-    objc_retainAutoreleasedReturnValue, objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName, object_getIndexedIvars,
-    protocol_getName, objc_getClassList, protocol_conformsToProtocol, Class, ClassExports, ClassTemplate,
+    objc_alloc, objc_allocWithZone, objc_allocateClassPair, objc_autorelease,
+    objc_autoreleasePoolPop, objc_autoreleasePoolPush, objc_autoreleaseReturnValue,
+    objc_begin_catch, objc_classes, objc_copyClassNamesForImage, objc_disposeClassPair,
+    objc_end_catch, objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass,
+    objc_getProtocol, objc_getRequiredClass, objc_lookUpClass, objc_readClassPair,
+    objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
+    objc_retainAutoreleaseReturnValue, objc_retainAutoreleasedReturnValue, objc_retainBlock,
+    objc_storeStrong, objc_unsafeClaimAutoreleasedReturnValue, object_getClass,
+    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol, protocol_getName,
+    swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
@@ -65,6 +64,7 @@ pub use properties::todo_objc_setter;
 pub use selectors::{selector, SEL};
 
 use crate::objc::classes::___objc_personality_v0;
+use crate::objc::classes::imp_implementationWithBlock;
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
@@ -74,11 +74,11 @@ use messages::{
 };
 use methods::method_list_t;
 use objects::{objc_object, HostObjectEntry};
+use properties::objc_setProperty_atomic;
 use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setProperty};
 use properties::{
     objc_setProperty_atomic_copy, objc_setProperty_nonatomic, objc_setProperty_nonatomic_copy,
 };
-use properties::objc_setProperty_atomic;
 use properties::{property_getAttributes, property_getName};
 use selectors::{sel_getName, sel_getUid, sel_isEqual, sel_registerName};
 use synchronization::{objc_sync_enter, objc_sync_exit};
@@ -98,20 +98,26 @@ pub type NSZonePtr = crate::mem::MutVoidPtr;
 /// Main type holding Objective-C runtime state.
 pub struct ObjC {
     /// Known selectors (interned method name strings).
-    selectors: HashMap<String, SEL>,
+    selectors: FxHashMap<String, SEL>,
 
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
-    objects: HashMap<id, HostObjectEntry>,
+    objects: FxHashMap<id, HostObjectEntry>,
+
+    /// Fake-borrow warnings already logged, as (object id, host type).
+    /// Games commonly retry operations on missing/faked objects every
+    /// frame; without this set the log fills with thousands of identical
+    /// "SUPER HACK!" lines. One warning per pair is enough for diagnosis.
+    fake_borrow_warned: std::sync::Mutex<std::collections::HashSet<(id, std::any::TypeId)>>,
 
     /// Known classes.
     ///
     /// Look at the `isa` to get the metaclass for a class.
-    classes: HashMap<String, Class>,
+    classes: FxHashMap<String, Class>,
 
     /// Mutexes used in @synchronized blocks (objc_sync_enter/exit).
-    sync_mutexes: HashMap<id, MutexId>,
+    sync_mutexes: FxHashMap<id, MutexId>,
 
     /// Per-object recursive mutexes used to make `atomic` properties
     /// thread-safe (`objc_getProperty(..., atomic=true)` /
@@ -130,7 +136,7 @@ pub struct ObjC {
     /// `copyWithZone:` of e.g. `NSMutableString` may itself synthesize
     /// further atomic-property reads on the same object. Lazy created
     /// on first contended access; cleaned up in `dealloc_object`.
-    property_locks: HashMap<id, MutexId>,
+    property_locks: FxHashMap<id, MutexId>,
 
     /// Temporary storage for optional type information when sending a message.
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
@@ -141,7 +147,7 @@ pub struct ObjC {
     /// (or were determined not to need it). Used to implement Apple's lazy
     /// `+initialize` dispatch contract:
     /// <https://developer.apple.com/documentation/objectivec/nsobject/1418639-initialize>
-    pub(super) initialized_classes: HashSet<Class>,
+    pub(super) initialized_classes: FxHashSet<Class>,
 
     /// ARC weak-reference side table.
     ///
@@ -159,7 +165,7 @@ pub struct ObjC {
     ///   `objc_storeWeak` / `objc_loadWeakRetained` / `objc_destroyWeak`.
     /// - Apple `objc-runtime-new.mm` `weak_table_t` (open-source on
     ///   <https://opensource.apple.com/source/objc4/>).
-    pub(crate) weak_refs: HashMap<id, Vec<crate::mem::MutPtr<id>>>,
+    pub(crate) weak_refs: FxHashMap<id, Vec<crate::mem::MutPtr<id>>>,
 
     /// Per-object table of values set via `objc_setAssociatedObject`.
     ///
@@ -173,7 +179,7 @@ pub struct ObjC {
     /// References:
     /// - <https://developer.apple.com/documentation/objectivec/1418509-objc_setassociatedobject>
     /// - Apple `objc-references.mm` (open-source `objc4`).
-    pub(crate) associated_objects: HashMap<(id, crate::mem::GuestUSize), (id, bool)>,
+    pub(crate) associated_objects: FxHashMap<(id, crate::mem::GuestUSize), (id, bool)>,
 
     /// Cache of opaque `Method` handles handed out to the guest.
     ///
@@ -187,7 +193,7 @@ pub struct ObjC {
     /// relies on (e.g. it compares `Method` pointers, or expects
     /// `method_getImplementation` on the returned handle to see the effect
     /// of a prior `method_setImplementation`).
-    pub(super) method_handles: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
+    pub(super) method_handles: FxHashMap<(Class, SEL), crate::mem::MutVoidPtr>,
 
     /// Reverse map from a synthesised `IMP` token pointer (see
     /// [Self::host_imp_tokens]) back to the real [methods::IMP]. Host
@@ -195,31 +201,32 @@ pub struct ObjC {
     /// `method_getImplementation` hands out a unique token pointer for them
     /// and records the mapping here so `method_setImplementation` /
     /// `method_exchangeImplementations` can round-trip host implementations.
-    pub(super) imp_tokens: HashMap<crate::mem::GuestUSize, methods::IMP>,
+    pub(super) imp_tokens: FxHashMap<crate::mem::GuestUSize, methods::IMP>,
 
     /// Cache of token pointers minted for host `IMP`s, keyed by the
     /// (defining class, selector) whose implementation the token stands in
     /// for. Keeps the token pointer stable so that
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
-    pub(super) host_imp_tokens: HashMap<(Class, SEL), crate::mem::MutVoidPtr>,
+    pub(super) host_imp_tokens: FxHashMap<(Class, SEL), crate::mem::MutVoidPtr>,
 }
 
 impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
-            selectors: HashMap::new(),
-            objects: HashMap::new(),
-            classes: HashMap::new(),
-            sync_mutexes: HashMap::new(),
-            property_locks: HashMap::new(),
+            selectors: FxHashMap::default(),
+            objects: FxHashMap::default(),
+            classes: FxHashMap::default(),
+            sync_mutexes: FxHashMap::default(),
+            fake_borrow_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
+            property_locks: FxHashMap::default(),
             message_type_info: None,
-            initialized_classes: HashSet::new(),
-            weak_refs: HashMap::new(),
-            associated_objects: HashMap::new(),
-            method_handles: HashMap::new(),
-            imp_tokens: HashMap::new(),
-            host_imp_tokens: HashMap::new(),
+            initialized_classes: FxHashSet::default(),
+            weak_refs: FxHashMap::default(),
+            associated_objects: FxHashMap::default(),
+            method_handles: FxHashMap::default(),
+            imp_tokens: FxHashMap::default(),
+            host_imp_tokens: FxHashMap::default(),
         }
     }
 
@@ -232,7 +239,6 @@ impl ObjC {
             .expect("get_selector_name: unknown selector")
     }
 }
-
 
 // ──────────────────────────────────────────────────────────────────
 // Associated objects  (<objc/runtime.h>)
@@ -296,7 +302,9 @@ fn objc_setAssociatedObject(
         _ => false,
     };
 
-    env.objc.associated_objects.insert(map_key, (value, is_retained));
+    env.objc
+        .associated_objects
+        .insert(map_key, (value, is_retained));
 }
 
 /// `id objc_getAssociatedObject(id object, const void *key)`
@@ -395,7 +403,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_unsafeClaimAutoreleasedReturnValue(_)),
     export_c_func!(objc_autoreleaseReturnValue(_)),
     export_c_func!(objc_retainAutoreleaseReturnValue(_)),
-    export_c_func!(objc_autoreleasePoolPush(_)),
+    export_c_func!(objc_autoreleasePoolPush()),
     export_c_func!(objc_autoreleasePoolPop(_)),
     export_c_func!(objc_retain(_)),
     export_c_func!(objc_retainAutorelease(_)),
@@ -404,6 +412,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_alloc(_)),
     export_c_func!(objc_autorelease(_)),
     export_c_func!(objc_retainBlock(_)),
+    export_c_func!(imp_implementationWithBlock(_)),
     export_c_func!(objc_release(_)),
     export_c_func!(objc_setProperty_nonatomic(_, _, _, _)),
     export_c_func!(objc_exception_throw(_)),
@@ -411,6 +420,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_end_catch(_)),
     export_c_func!(class_getSuperclass(_)),
     export_c_func!(class_getInstanceSize(_, _)),
+    export_c_func!(class_isMetaClass(_)),
     export_c_func!(class_getInstanceMethod(_, _)),
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),

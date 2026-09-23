@@ -21,9 +21,9 @@ use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::frameworks::foundation::ns_string;
 use crate::libc::mach::host::physical_memory;
 use crate::mem::SafeRead;
-use crate::objc::{id, msg, msg_class, objc_classes, ClassExports};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports};
 use crate::Environment;
-use std::time::Instant;
+use std::collections::HashMap;
 
 /// `NSOperatingSystemVersion` from `Foundation/NSProcessInfo.h`.
 ///
@@ -65,6 +65,17 @@ impl GuestArg for NSOperatingSystemVersion {
 pub struct State {
     /// `NSProcessInfo*`
     process_info: Option<id>,
+    /// Outstanding activity assertions from
+    /// `-beginActivityWithOptions:reason:`, keyed by the token object that
+    /// was handed to the guest. Per Apple's documentation, the token is an
+    /// opaque object that must be passed back to `-endActivity:`.
+    active_activities: HashMap<id, ActivityInfo>,
+}
+
+/// Bookkeeping for one outstanding activity assertion.
+struct ActivityInfo {
+    options: u64,
+    reason: String,
 }
 
 fn assert_process_info_singleton(env: &mut Environment, this: id) {
@@ -84,9 +95,12 @@ fn assert_process_info_singleton(env: &mut Environment, this: id) {
 /// iOS 8+ feature gate (which is the floor for many third-party SDKs that
 /// query `operatingSystemVersion`) passes without triggering the
 /// "unsupported version" path inside the app.
-const OS_VERSION_MAJOR: i32 = 12;
-const OS_VERSION_MINOR: i32 = 0;
-const OS_VERSION_PATCH: i32 = 0;
+fn os_version(env: &Environment) -> (i32, i32, i32) {
+    env.options
+        .as_ref()
+        .ios_version
+        .unwrap_or(crate::options::LATEST_IOS_VERSION)
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -133,7 +147,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_process_info_singleton(env, this);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let uptime_ns = Instant::now()
+    let uptime_ns = env.guest_clock.now()
         .duration_since(env.startup_time)
         .as_nanos() as u64;
     let s = format!("1234-{}-{}", uptime_ns, n);
@@ -185,7 +199,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)systemUptime {
     assert_process_info_singleton(env, this);
-    Instant::now().duration_since(env.startup_time).as_secs_f64()
+    env.guest_clock.now().duration_since(env.startup_time).as_secs_f64()
 }
 
 // =========================================================================
@@ -205,19 +219,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 // pointer, which produced the assertion failure observed in Bloons TD 5.
 - (NSOperatingSystemVersion)operatingSystemVersion {
     assert_process_info_singleton(env, this);
-    NSOperatingSystemVersion {
-        major: OS_VERSION_MAJOR,
-        minor: OS_VERSION_MINOR,
-        patch: OS_VERSION_PATCH,
-    }
+    let (major, minor, patch) = os_version(env);
+    NSOperatingSystemVersion { major, minor, patch }
 }
 
 - (id)operatingSystemVersionString {
     assert_process_info_singleton(env, this);
-    let s = format!(
-        "Version {}.{}.{} (Build 16A366)",
-        OS_VERSION_MAJOR, OS_VERSION_MINOR, OS_VERSION_PATCH
-    );
+    // Per Apple's documentation this returns a human-readable version string.
+    // Apps (e.g. Puzzle Agent) use it together with operatingSystemName for
+    // platform diagnostics.
+    let (major, minor, patch) = os_version(env);
+    let s = format!("Version {major}.{minor}.{patch} (Build 16A366)");
     let cstr = env.mem.alloc_and_write_cstr(s.as_bytes());
     msg_class![env; NSString stringWithUTF8String:cstr]
 }
@@ -235,10 +247,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 // (`...:minor:patch:`), so it was unreachable from real apps.
 - (bool)isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion)version {
     assert_process_info_singleton(env, this);
+    let (current_major, current_minor, current_patch) = os_version(env);
     let NSOperatingSystemVersion { major, minor, patch } = version;
-    if major != OS_VERSION_MAJOR { return major < OS_VERSION_MAJOR; }
-    if minor != OS_VERSION_MINOR { return minor < OS_VERSION_MINOR; }
-    patch <= OS_VERSION_PATCH
+    if major != current_major {
+        return major < current_major;
+    }
+    if minor != current_minor {
+        return minor < current_minor;
+    }
+    patch <= current_patch
 }
 
 // =========================================================================
@@ -264,21 +281,77 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Activity assertions (iOS 7+)
 // =========================================================================
 
-- (id)beginActivityWithOptions:(u64)_options reason:(id)_reason {
+- (id)beginActivityWithOptions:(u64)options reason:(id)reason {
     assert_process_info_singleton(env, this);
-    log!("TODO: [NSProcessInfo beginActivityWithOptions:reason:] — returning stub token");
-    this
+
+    // Per the NSProcessInfo documentation the return value is an opaque
+    // activity token that must be passed back to -endActivity:. Returning
+    // `this` (as the old stub did) is wrong: the app could then pass the
+    // process-info object itself back to -endActivity:, and two concurrent
+    // activities would be indistinguishable. Give out unique NSObject
+    // tokens instead, like -NSNotificationCenter's block-observation
+    // tokens, and remember them so -endActivity: can match them.
+    let token: id = msg_class![env; NSObject new];
+    retain(env, token);
+
+    let reason_str = if reason == nil {
+        String::new()
+    } else {
+        ns_string::to_rust_string(env, reason).into_owned()
+    };
+    log_dbg!(
+        "[NSProcessInfo beginActivityWithOptions:{:#x} reason:{:?}] -> token {:?}",
+        options,
+        reason_str,
+        token
+    );
+
+    let state = &mut env.framework_state.foundation.ns_process_info;
+    state
+        .active_activities
+        .insert(token, ActivityInfo { options, reason: reason_str });
+
+    token
 }
 
-- (())endActivity:(id)_activity {
+- (())endActivity:(id)activity {
     assert_process_info_singleton(env, this);
+    if activity == nil {
+        // Passing nil is a caller bug; Apple's documentation does not
+        // define the behaviour, so just ignore it.
+        return;
+    }
+    let state = &mut env.framework_state.foundation.ns_process_info;
+    match state.active_activities.remove(&activity) {
+        Some(info) => {
+            log_dbg!(
+                "[(NSProcessInfo*){:?} endActivity:{:?}] ended activity \"{}\" (options {:#x})",
+                this,
+                activity,
+                info.reason,
+                info.options
+            );
+            release(env, activity);
+        }
+        None => {
+            log!(
+                "Warning: [NSProcessInfo endActivity:{:?}] called with an unknown activity token; ignoring.",
+                activity
+            );
+        }
+    }
 }
 
-- (())performActivityWithOptions:(u64)_options
-                          reason:(id)_reason
+- (())performActivityWithOptions:(u64)options
+                          reason:(id)reason
                       usingBlock:(id)block {
     assert_process_info_singleton(env, this);
+    // Apple's contract: apply the activity for the duration of the block.
+    // (The `wait` behaviour only matters across threads, which HLE does not
+    // model — the block is always run synchronously here.)
+    let token: id = msg![env; this beginActivityWithOptions:options reason:reason];
     let _: () = msg![env; block invoke];
+    let _: () = msg![env; this endActivity:token];
 }
 
 // =========================================================================
@@ -314,13 +387,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_process_info_singleton(env, this); // TODO
     // This is the value documented by Foundation for the Darwin/Mach family.
     ns_string::get_static_str(env, "NSMACHOperatingSystem")
-}
-
-- (id)operatingSystemVersionString {
-    assert_process_info_singleton(env, this); // TODO
-    // Human-readable only. Puzzle Agent uses this together with
-    // operatingSystemName while collecting platform diagnostics.
-    ns_string::get_static_str(env, "Version 3.1.3 (Build 7E18)")
 }
 
 @end

@@ -292,6 +292,21 @@ fn gethostbyname(env: &mut Environment, name: ConstPtr<u8>) -> MutPtr<u8> {
         match hostname.as_str() {
             "localhost" | "loopback" | "touchHLE" => [127, 0, 0, 1],
             "broadcasthost" => [255, 255, 255, 255],
+            // Games (e.g. Gameloft titles) broadcast LAN discovery to the
+            // name of their own service or to wildcard hostnames; also map
+            // names ending in `.local` to the host's primary LAN address so
+            // peer connections land on the emulator's real interface.
+            _ if hostname.to_lowercase().ends_with(".local") => {
+                let host_ip = crate::libc::ifaddrs::primary_lan_ipv4()
+                    .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                    .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+                log!(
+                    "gethostbyname(\"{}\"): .local -> host LAN address {}",
+                    hostname,
+                    host_ip
+                );
+                host_ip.octets()
+            }
             _ => {
                 if !env.options.network_access {
                     log!(
@@ -739,10 +754,70 @@ fn gai_strerror(env: &mut Environment, ecode: i32) -> ConstPtr<u8> {
 /// `gethostent` iterates the hosts database. We don't model one, so signal
 /// end-of-database (NULL) immediately, matching how `gethostbyname` reports an
 /// unresolved host.
-fn gethostent(_env: &mut Environment) -> MutPtr<hostent_guest> {
-    log!("TODO: gethostent() => NULL");
-    // TODO: set h_errno
+fn gethostent(env: &mut Environment) -> MutPtr<hostent_guest> {
+    log_dbg!("gethostent() => NULL (no hosts database)");
+    set_h_errno(env, H_ERRNO_HOST_NOT_FOUND);
     Ptr::null()
+}
+
+fn getipnodebyname(
+    env: &mut Environment,
+    name: ConstPtr<u8>,
+    af: i32,
+    flags: i32,
+    error_num: MutPtr<i32>,
+) -> MutPtr<u8> {
+    let host = if name.is_null() {
+        "localhost".to_owned()
+    } else {
+        env.mem.cstr_at_utf8(name).unwrap_or_default().to_owned()
+    };
+    let allowed_flags = AI_V4MAPPED | AI_ALL | AI_ADDRCONFIG;
+
+    if !error_num.is_null() {
+        env.mem.write(error_num, 0);
+    }
+
+    if af != AF_INET {
+        if !error_num.is_null() {
+            env.mem.write(error_num, NO_RECOVERY);
+        }
+        log!(
+            "getipnodebyname(\"{}\"): unsupported family {} -> NO_RECOVERY",
+            host,
+            af
+        );
+        return MutPtr::null();
+    }
+
+    if flags & !allowed_flags != 0 {
+        if !error_num.is_null() {
+            env.mem.write(error_num, NO_RECOVERY);
+        }
+        log!(
+            "getipnodebyname(\"{}\"): unsupported flags 0x{:x} -> NO_RECOVERY",
+            host,
+            flags
+        );
+        return MutPtr::null();
+    }
+
+    let result = gethostbyname(env, name);
+    if result.is_null() && !error_num.is_null() {
+        env.mem.write(error_num, H_ERRNO_HOST_NOT_FOUND);
+    }
+    result
+}
+
+fn freehostent(env: &mut Environment, hostent: MutPtr<u8>) {
+    if hostent.is_null() {
+        return;
+    }
+
+    if hostent.to_bits() == env.libc_state.netdb.dummy_hostent_ptr {
+        env.libc_state.netdb.dummy_hostent_ptr = 0;
+    }
+    env.mem.free(hostent.cast());
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -752,6 +827,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(gethostent()),
     export_c_func!(gethostbyname2(_, _)),
     export_c_func!(gethostbyaddr(_, _, _)),
+    export_c_func!(getipnodebyname(_, _, _, _)),
+    export_c_func!(freehostent(_)),
     export_c_func!(getservbyname(_, _)),
     export_c_func!(getservbyport(_, _)),
     export_c_func!(getnameinfo(_, _, _, _, _, _, _)),
@@ -768,3 +845,4 @@ pub const CONSTANTS: ConstantExports = &[(
     "_h_errno",
     HostConstant::Custom(|env| -> ConstVoidPtr { h_errno_ptr(env).cast().cast_const() }),
 )];
+

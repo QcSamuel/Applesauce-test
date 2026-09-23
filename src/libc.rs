@@ -16,6 +16,7 @@ pub mod arpa;
 pub mod asl;
 pub mod blocks;
 pub mod clocale;
+pub mod codesign;
 pub mod crypto;
 pub mod ctype;
 pub mod cxxabi;
@@ -41,6 +42,8 @@ pub mod net;
 pub mod netdb;
 pub mod posix_io;
 pub mod pthread;
+pub mod pwd;
+pub mod resolv;
 pub mod sched;
 pub mod semaphore;
 pub mod setjmp;
@@ -90,6 +93,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         asl::FUNCTIONS,
         blocks::FUNCTIONS,
         clocale::FUNCTIONS,
+        codesign::FUNCTIONS,
         ctype::FUNCTIONS,
         cxxabi::FUNCTIONS,
         crypto::FUNCTIONS,
@@ -130,6 +134,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         pthread::once::FUNCTIONS,
         pthread::rwlock::FUNCTIONS,
         pthread::thread::FUNCTIONS,
+        pwd::FUNCTIONS,
+        resolv::FUNCTIONS,
         sched::FUNCTIONS,
         semaphore::FUNCTIONS,
         setjmp::FUNCTIONS,
@@ -142,6 +148,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         string::FUNCTIONS,
         sys::mount::FUNCTIONS,
         sys::ptrace::FUNCTIONS,
+        sys::resource::FUNCTIONS,
         sys::timeb::FUNCTIONS,
         sys::socket::FUNCTIONS,
         sys::utsname::FUNCTIONS,
@@ -168,6 +175,7 @@ pub struct State {
     pub pthread: pthread::State,
     pub semaphore: semaphore::State,
     pub socket: sys::socket::State,
+    resource: sys::resource::State,
     stdlib: stdlib::State,
     string: string::State,
     signal: signal::State,
@@ -177,5 +185,6 @@ pub struct State {
     clocale: clocale::State,
     mach_o: mach_o::State,
     mach_vm: mach::vm_map::State,
+    mach_ports: mach::mach_port::State,
     mmap: mmap::State,
 }

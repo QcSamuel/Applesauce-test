@@ -56,14 +56,8 @@ pub const CONSTANTS: ConstantExports = &[
         "_NSURLIsExcludedFromBackupKey",
         HostConstant::NSString("NSURLIsExcludedFromBackupKey"),
     ),
-    (
-        "_NSURLNameKey",
-        HostConstant::NSString("NSURLNameKey"),
-    ),
-    (
-        "_NSURLPathKey",
-        HostConstant::NSString("NSURLPathKey"),
-    ),
+    ("_NSURLNameKey", HostConstant::NSString("NSURLNameKey")),
+    ("_NSURLPathKey", HostConstant::NSString("NSURLPathKey")),
     (
         "_NSURLLocalizedNameKey",
         HostConstant::NSString("NSURLLocalizedNameKey"),
@@ -806,8 +800,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
-@implementation NSNetServiceBrowser: NSObject
-@end
+// NSNetService / NSNetServiceBrowser are implemented in
+// foundation::ns_net_service on top of the real CFNetService mDNS stack.
 
 // NSHTTPURLResponse is defined in foundation::ns_url_response; not
 // duplicated here.

@@ -13,15 +13,15 @@ use crate::frameworks::foundation::{ns_data, ns_string, NSInteger};
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::fs::GuestPath;
 use crate::image::Image;
+use crate::mem::MutVoidPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, SEL,
 };
-use crate::mem::MutVoidPtr;
 use crate::Environment;
 use std::collections::HashMap;
 
-const CACHE_SIZE: usize = 10;
+const CACHE_SIZE: usize = 60;
 
 #[derive(Default)]
 pub struct State {
@@ -194,6 +194,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGSize)size {
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    // An image created via bare -alloc/-init has no CGImage; Apple returns
+    // a zero size rather than crashing.
+    if image.is_null() {
+        return CGSize { width: 0.0, height: 0.0 };
+    }
     let (width, height) = cg_image::borrow_image(&env.objc, image).dimensions();
     CGSize {
         width: width as _,
@@ -241,6 +246,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    // Drawing a nil image is a no-op, not a crash.
+    if image == nil { return; }
     let rect = CGRect {
         origin: point,
         size: CGSize {
@@ -260,6 +267,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // частей (nine-patch)
     // и отрисовывать через CGContextDrawImage кусками. Пока рисуем целиком.
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    // Drawing a nil image is a no-op, not a crash.
+    if image == nil { return; }
     CGContextDrawImage(env, context, rect, image);
 }
 
@@ -272,6 +281,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    // Drawing a nil image is a no-op, not a crash.
+    if image == nil { return; }
     CGContextDrawImage(env, context, rect, image);
 }
 
@@ -279,6 +290,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context = UIGraphicsGetCurrentContext(env);
     if context == nil { return; }
     let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    // Drawing a nil image is a no-op, not a crash.
+    if image == nil { return; }
     let rect = CGRect {
         origin: point,
         size: CGSize {
@@ -393,7 +406,14 @@ fn UIImageWriteToSavedPhotosAlbum(
     if image == nil {
         log!("UIImageWriteToSavedPhotosAlbum: nil image, ignoring.");
         // Still invoke callback if requested, with nil error
-        invoke_save_completion(env, completion_target, completion_selector, image, nil, context_info);
+        invoke_save_completion(
+            env,
+            completion_target,
+            completion_selector,
+            image,
+            nil,
+            context_info,
+        );
         return;
     }
 
@@ -427,14 +447,17 @@ fn UIImageWriteToSavedPhotosAlbum(
                 Ok(()) => {
                     log!(
                         "UIImageWriteToSavedPhotosAlbum: saved {}x{} image to {}",
-                        w, h, docs_path
+                        w,
+                        h,
+                        docs_path
                     );
                     true
                 }
                 Err(e) => {
                     log!(
                         "UIImageWriteToSavedPhotosAlbum: failed to write {}: {:?}",
-                        docs_path, e
+                        docs_path,
+                        e
                     );
                     false
                 }
@@ -460,7 +483,14 @@ fn UIImageWriteToSavedPhotosAlbum(
                                                        userInfo:nil];
         error
     };
-    invoke_save_completion(env, completion_target, completion_selector, image, error, context_info);
+    invoke_save_completion(
+        env,
+        completion_target,
+        completion_selector,
+        image,
+        error,
+        context_info,
+    );
 }
 
 /// Invokes the `UIImageWriteToSavedPhotosAlbum` completion callback. Per

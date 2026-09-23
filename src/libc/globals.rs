@@ -23,6 +23,13 @@ use crate::dyld::{ConstantExports, HostConstant};
 use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, MutPtr, Ptr};
 use crate::Environment;
 
+/// `extern char *optarg;` — current argument of `getopt(3)`. No argument
+/// parsing is performed, so it permanently points at a NULL string.
+fn optarg_ptr(env: &mut Environment) -> ConstVoidPtr {
+    let null_str: ConstPtr<u8> = Ptr::null();
+    env.mem.alloc_and_write(null_str).cast().cast_const()
+}
+
 /// `extern char **environ;` — base of the program's environment vector.
 /// touchHLE has no real environment block, so we expose a one-element
 /// NUL-terminated array (`{ NULL }`) which is what newly-spawned
@@ -62,8 +69,7 @@ fn daylight_ptr(env: &mut Environment) -> ConstVoidPtr {
 /// memory, then point the array elements at the buffers. `tzset()`
 /// updates the buffer contents and array pointers later.
 fn tzname_ptr(env: &mut Environment) -> ConstVoidPtr {
-    let arr_ptr: MutPtr<ConstPtr<u8>> =
-        env.mem.alloc(2 * guest_size_of::<ConstPtr<u8>>()).cast();
+    let arr_ptr: MutPtr<ConstPtr<u8>> = env.mem.alloc(2 * guest_size_of::<ConstPtr<u8>>()).cast();
     env.libc_state.time.tzname_array_ptr = Some(arr_ptr);
 
     let std_buf: MutPtr<u8> = env.mem.alloc(32).cast();
@@ -109,6 +115,7 @@ fn vm_page_shift_ptr(env: &mut Environment) -> ConstVoidPtr {
 }
 
 pub const CONSTANTS: ConstantExports = &[
+    ("_optarg", HostConstant::Custom(optarg_ptr)),
     ("_environ", HostConstant::Custom(environ_ptr)),
     ("_timezone", HostConstant::Custom(timezone_ptr)),
     ("_daylight", HostConstant::Custom(daylight_ptr)),
