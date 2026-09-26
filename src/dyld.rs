@@ -64,6 +64,9 @@ pub struct HostDylib {
     pub function_exports: &'static [FunctionExports],
 }
 
+/// Debug: number of upcoming host calls to log.
+pub static TRACE_HOST_CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub type HostFunction = &'static dyn CallFromGuest;
 
 /// Type for lists of functions exported by host implementations of dynamic
@@ -216,9 +219,17 @@ fn alloc_a32_ret_stub(mem: &mut Mem) -> MutPtr<u32> {
     fn_ptr
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CxxAbiTypeInfoKind {
+    Class,
+    SingleInheritance,
+    MultipleInheritance,
+}
+
 fn link_cxxabi_vtable(
     name: &str,
     cxxabi_vtable_addrs: &mut HashMap<String, u32>,
+    typeinfo_vtable_kinds: &mut HashMap<u32, CxxAbiTypeInfoKind>,
     mem: &mut Mem,
 ) -> ConstVoidPtr {
     let addr = *cxxabi_vtable_addrs
@@ -234,31 +245,38 @@ fn link_cxxabi_vtable(
             }
             v.to_bits()
         });
+    let kind = match name {
+        "__ZTVN10__cxxabiv117__class_type_infoE" => Some(CxxAbiTypeInfoKind::Class),
+        "__ZTVN10__cxxabiv120__si_class_type_infoE" => {
+            Some(CxxAbiTypeInfoKind::SingleInheritance)
+        }
+        "__ZTVN10__cxxabiv121__vmi_class_type_infoE" => {
+            Some(CxxAbiTypeInfoKind::MultipleInheritance)
+        }
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        typeinfo_vtable_kinds.insert(addr + 8, kind);
+    }
     Ptr::from_bits(addr).cast_const()
 }
 
 fn link_cxxabi_typeinfo(
     name: &str,
     cxxabi_vtable_addrs: &mut HashMap<String, u32>,
+    typeinfo_vtable_kinds: &mut HashMap<u32, CxxAbiTypeInfoKind>,
     mem: &mut Mem,
 ) -> ConstVoidPtr {
     let name_bytes = name.strip_prefix('_').unwrap_or(name);
     let name_cstr = mem.alloc_and_write_cstr(name_bytes.as_bytes());
     let ti: MutPtr<u32> = mem.alloc(8).cast();
-    let vtable_addr = *cxxabi_vtable_addrs
-        .entry("__ZTVN10__cxxabiv117__class_type_infoE".to_string())
-        .or_insert_with(|| {
-            let stub = alloc_a32_ret_stub(mem);
-            let stub_addr = stub.to_bits();
-            let v: MutPtr<u32> = mem.alloc(40).cast();
-            mem.write(v + 0, 0);
-            mem.write(v + 1, 0);
-            for i in 2..10 {
-                mem.write(v + i, stub_addr);
-            }
-            v.to_bits()
-        });
-    mem.write(ti + 0, vtable_addr + 8);
+    let vtable = link_cxxabi_vtable(
+        "__ZTVN10__cxxabiv117__class_type_infoE",
+        cxxabi_vtable_addrs,
+        typeinfo_vtable_kinds,
+        mem,
+    );
+    mem.write(ti + 0, vtable.to_bits() + 8);
     mem.write(ti + 1, name_cstr.to_bits());
     ti.cast().cast_const()
 }
@@ -408,6 +426,8 @@ pub struct Dyld {
     swift_fn_names: HashMap<String, &'static str>,
     /// Stable data slots for Swift metadata symbols.
     swift_data_slots: HashMap<String, u32>,
+    cxxabi_typeinfo_vtable_kinds: HashMap<u32, CxxAbiTypeInfoKind>,
+    guest_sjlj_runtime_available: bool,
 }
 
 impl Dyld {
@@ -441,7 +461,18 @@ impl Dyld {
             swift_fn_cache: HashMap::new(),
             swift_fn_names: HashMap::new(),
             swift_data_slots: HashMap::new(),
+            cxxabi_typeinfo_vtable_kinds: HashMap::new(),
+            guest_sjlj_runtime_available: false,
         }
+    }
+
+    pub(crate) fn cxxabi_typeinfo_kind(
+        &self,
+        typeinfo_vtable_addrpoint: u32,
+    ) -> Option<CxxAbiTypeInfoKind> {
+        self.cxxabi_typeinfo_vtable_kinds
+            .get(&typeinfo_vtable_addrpoint)
+            .copied()
     }
 
     pub fn return_to_host_routine(&self) -> GuestFunction {
@@ -463,6 +494,14 @@ impl Dyld {
     ) {
         assert!(self.return_to_host_routine.is_none());
         assert!(self.thread_exit_routine.is_none());
+        self.guest_sjlj_runtime_available = has_guest_sjlj_runtime(|symbol| {
+            bins.iter()
+                .any(|bin| bin.exported_symbols.contains_key(symbol))
+        });
+        log!(
+            "Guest C++ SjLj runtime available: {}",
+            self.guest_sjlj_runtime_available
+        );
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
@@ -507,77 +546,79 @@ impl Dyld {
         // historically `std::string(NULL)` would yield an empty string on
         // Apple's libstdc++ as well (and Geometry Dash 1.0 launched on
         // Adreno devices that hit this code path).
-        for dylib in bins.iter().skip(1) {
-            let mut patch_count = 0;
-            for sym in [
-                "__ZSt19__throw_logic_errorPKc",
-                "__ZSt20__throw_length_errorPKc",
-                "__ZSt20__throw_out_of_rangePKc",
-                "__ZSt17__throw_bad_allocv",
-                "__ZSt16__throw_bad_castv",
-                "__ZSt19__throw_range_errorPKc",
-                "__ZSt22__throw_overflow_errorPKc",
-                "__ZSt23__throw_underflow_errorPKc",
-                "__ZSt21__throw_runtime_errorPKc",
-                "__ZSt24__throw_invalid_argumentPKc",
-                "__ZSt23__throw_ios_failurePKc",
-                "__ZSt18__throw_bad_typeidv",
-                "__ZSt19__throw_bad_exceptionv",
-                "__ZSt25__throw_bad_function_callv",
-            ] {
-                let Some(&entry_with_thumb_bit) = dylib.exported_symbols.get(sym) else {
-                    continue;
-                };
-                let entry = entry_with_thumb_bit & !1;
-                let is_thumb = (entry_with_thumb_bit & 1) != 0;
-                if is_thumb {
-                    // Thumb-1 BX LR = 0x4770. Pad the 32-bit word with a NOP
-                    // (0x46C0 = mov r8, r8) so the surrounding code stays
-                    // valid if execution somehow falls through.
-                    let function_ptr: MutPtr<u32> = Ptr::from_bits(entry);
-                    mem.write(function_ptr, 0x46C0_4770);
-                } else {
-                    // ARM `BX LR` = 0xE12FFF1E.
-                    let function_ptr: MutPtr<u32> = Ptr::from_bits(entry);
-                    mem.write(function_ptr, 0xE12FFF1E);
+        if !self.guest_sjlj_runtime_available {
+            for dylib in bins.iter().skip(1) {
+                let mut patch_count = 0;
+                for sym in [
+                    "__ZSt19__throw_logic_errorPKc",
+                    "__ZSt20__throw_length_errorPKc",
+                    "__ZSt20__throw_out_of_rangePKc",
+                    "__ZSt17__throw_bad_allocv",
+                    "__ZSt16__throw_bad_castv",
+                    "__ZSt19__throw_range_errorPKc",
+                    "__ZSt22__throw_overflow_errorPKc",
+                    "__ZSt23__throw_underflow_errorPKc",
+                    "__ZSt21__throw_runtime_errorPKc",
+                    "__ZSt24__throw_invalid_argumentPKc",
+                    "__ZSt23__throw_ios_failurePKc",
+                    "__ZSt18__throw_bad_typeidv",
+                    "__ZSt19__throw_bad_exceptionv",
+                    "__ZSt25__throw_bad_function_callv",
+                ] {
+                    let Some(&entry_with_thumb_bit) = dylib.exported_symbols.get(sym) else {
+                        continue;
+                    };
+                    let entry = entry_with_thumb_bit & !1;
+                    let is_thumb = (entry_with_thumb_bit & 1) != 0;
+                    if is_thumb {
+                        // Thumb-1 BX LR = 0x4770. Pad the 32-bit word with a NOP
+                        // (0x46C0 = mov r8, r8) so the surrounding code stays
+                        // valid if execution somehow falls through.
+                        let function_ptr: MutPtr<u32> = Ptr::from_bits(entry);
+                        mem.write(function_ptr, 0x46C0_4770);
+                    } else {
+                        // ARM `BX LR` = 0xE12FFF1E.
+                        let function_ptr: MutPtr<u32> = Ptr::from_bits(entry);
+                        mem.write(function_ptr, 0xE12FFF1E);
+                    }
+                    patch_count += 1;
+                    log_dbg!(
+                        "Patched libstdc++ {} at {:#x} (thumb={}) -> bx lr",
+                        sym,
+                        entry_with_thumb_bit,
+                        is_thumb
+                    );
                 }
-                patch_count += 1;
-                log_dbg!(
-                    "Patched libstdc++ {} at {:#x} (thumb={}) -> bx lr",
-                    sym,
-                    entry_with_thumb_bit,
-                    is_thumb
-                );
-            }
-            if patch_count > 0 {
-                log!(
-                    "Patched {} libstdc++ std::__throw_* helpers to return \
-                     instead of throwing (avoids host-process abort when \
-                     guest C++ code hits soft failures like std::string(NULL)).",
-                    patch_count
-                );
-            }
+                if patch_count > 0 {
+                    log!(
+                        "Patched {} libstdc++ std::__throw_* helpers to return \
+                         instead of throwing (avoids host-process abort when \
+                         guest C++ code hits soft failures like std::string(NULL)).",
+                        patch_count
+                    );
+                }
 
-            // `std::string(const char*)` with a NULL argument is constructed
-            // via `_S_construct(NULL, NULL + npos)`. libstdc++ detects the NULL
-            // pointer and calls `std::__throw_logic_error("basic_string::
-            // _S_construct null not valid")`. With the `__throw_*` helpers
-            // neutered to `BX LR` above, that throw becomes a no-op and
-            // execution falls through to the *normal* construction path, which
-            // does `memcpy(rep_data, NULL, npos)` and sets the string length to
-            // `npos`. The over-sized copy is skipped by `Mem::memmove`, but the
-            // resulting corrupt (length == npos) string sends some apps into an
-            // effectively infinite loop (e.g. Turbo Dismount's startup builds
-            // std::strings from a table that contains a NULL entry under
-            // touchHLE).
-            //
-            // The documented intent of the throw-neutering is for `std::
-            // string(NULL)` to behave like an *empty* string. We make that
-            // actually happen by retargeting the NULL-pointer branch inside
-            // `_S_construct` so it jumps to the function's existing
-            // "empty string" path (which returns `_S_empty_rep()._M_refdata()`)
-            // instead of the throw / over-sized-copy path.
-            patch_string_s_construct_null(dylib, mem);
+                // `std::string(const char*)` with a NULL argument is constructed
+                // via `_S_construct(NULL, NULL + npos)`. libstdc++ detects the NULL
+                // pointer and calls `std::__throw_logic_error("basic_string::
+                // _S_construct null not valid")`. With the `__throw_*` helpers
+                // neutered to `BX LR` above, that throw becomes a no-op and
+                // execution falls through to the *normal* construction path, which
+                // does `memcpy(rep_data, NULL, npos)` and sets the string length to
+                // `npos`. The over-sized copy is skipped by `Mem::memmove`, but the
+                // resulting corrupt (length == npos) string sends some apps into an
+                // effectively infinite loop (e.g. Turbo Dismount's startup builds
+                // std::strings from a table that contains a NULL entry under
+                // touchHLE).
+                //
+                // The documented intent of the throw-neutering is for `std::
+                // string(NULL)` to behave like an *empty* string. We make that
+                // actually happen by retargeting the NULL-pointer branch inside
+                // `_S_construct` so it jumps to the function's existing
+                // "empty string" path (which returns `_S_empty_rep()._M_refdata()`)
+                // instead of the throw / over-sized-copy path.
+                patch_string_s_construct_null(dylib, mem);
+            }
         }
     }
 
@@ -619,13 +660,6 @@ impl Dyld {
                 ","
             };
             let symbol = symbol.as_ref().unwrap();
-            if let Some(&(_, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
-                writeln!(
-                    file,
-                    "        {{ \"symbol\": \"{symbol}\", \"linked_to\": \"host\"}}{comma}"
-                )?;
-                continue;
-            }
             for dylib in bins.iter() {
                 if dylib.exported_symbols.contains_key(symbol) {
                     writeln!(
@@ -635,6 +669,13 @@ impl Dyld {
                     )?;
                     continue 'sym;
                 }
+            }
+            if let Some((_, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
+                writeln!(
+                    file,
+                    "        {{ \"symbol\": \"{symbol}\", \"linked_to\": \"host\"}}{comma}"
+                )?;
+                continue;
             }
             writeln!(file, "        {{ \"symbol\": \"{symbol}\" }}{comma}")?;
         }
@@ -824,6 +865,15 @@ impl Dyld {
             // offset that should be applied to the external symbol's address.
             // It is often 0, but not always.
             let offset: u32 = mem.read(ptr_ptr).to_bits();
+            let guest_cxxabi_export = if self.guest_sjlj_runtime_available
+                && is_guest_cxxabi_symbol(name)
+            {
+                bins.iter()
+                    .find_map(|other_bin| other_bin.exported_symbols.get(name))
+                    .copied()
+            } else {
+                None
+            };
             let target: ConstVoidPtr = if let Some(name) = name.strip_prefix("_OBJC_CLASS_$_") {
                 objc.link_class(name, /* is_metaclass: */ false, mem)
                     .cast()
@@ -835,6 +885,9 @@ impl Dyld {
             } else if name == "___CFConstantStringClassReference" {
                 // See ns_string::register_constant_strings
                 nil.cast().cast_const()
+            } else if let Some(addr) = guest_cxxabi_export {
+                log_dbg!("Linked guest C++ ABI symbol {} at {:#x}", name, addr);
+                Ptr::from_bits(addr)
             } else if name == "___mb_cur_max" {
                 // __mb_cur_max is a pointer to the C locale's max
                 // multibyte character byte count. libstdc++ reads
@@ -896,7 +949,12 @@ impl Dyld {
                 //
                 // The relocation addend (usually +8) is applied below, so we
                 // return the vtable base here.
-                let target = link_cxxabi_vtable(name, &mut cxxabi_vtable_addrs, mem);
+                let target = link_cxxabi_vtable(
+                    name,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
                 log_dbg!("Stubbed C++ vtable {} -> {:#x}", name, target.to_bits());
                 target
             } else if name == "___gxx_personality_sj0" {
@@ -977,7 +1035,12 @@ impl Dyld {
                 // The name string is never actually used for comparison (RTTI
                 // compares by pointer identity on most embedded platforms), but
                 // providing a non-NULL value prevents crashes in debuggers.
-                let ti = link_cxxabi_typeinfo(name, &mut cxxabi_vtable_addrs, mem);
+                let ti = link_cxxabi_typeinfo(
+                    name,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
                 log_dbg!("Stubbed C++ typeinfo {} at {:#x}", name, ti.to_bits());
                 ti
             } else if name == "___objc_personality_v0" {
@@ -1381,7 +1444,12 @@ impl Dyld {
                 || symbol == "__ZTVN10__cxxabiv117__pbase_type_infoE"
                 || symbol == "__ZTVN10__cxxabiv129__pointer_to_member_type_infoE"
             {
-                let target = link_cxxabi_vtable(symbol, &mut cxxabi_vtable_addrs, mem);
+                let target = link_cxxabi_vtable(
+                    symbol,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
                 // A non-lazy symbol pointer holds the plain address of the
                 // named symbol (no addend), so it resolves to the vtable base.
                 mem.write(ptr_ptr, target);
@@ -1435,7 +1503,12 @@ impl Dyld {
                 || symbol == "__ZTIPw"
                 || symbol == "__ZTIPKw"
             {
-                let ti = link_cxxabi_typeinfo(symbol, &mut cxxabi_vtable_addrs, mem);
+                let ti = link_cxxabi_typeinfo(
+                    symbol,
+                    &mut cxxabi_vtable_addrs,
+                    &mut self.cxxabi_typeinfo_vtable_kinds,
+                    mem,
+                );
                 mem.write(ptr_ptr, ti);
                 log_dbg!("Stubbed C++ typeinfo {} at {:#x}", symbol, ti.to_bits());
                 continue;
@@ -1512,6 +1585,10 @@ impl Dyld {
                     return None;
                 };
                 log_dbg!("Call to host function, already linked: {}", symbol);
+                if TRACE_HOST_CALLS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    TRACE_HOST_CALLS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    log!("HOSTCALL {} lr={:#x}", symbol, cpu.regs()[14]);
+                }
                 Some(f)
             }
         }
@@ -1602,6 +1679,29 @@ impl Dyld {
         assert!(offset.is_multiple_of(info.entry_size));
         let idx = (offset / info.entry_size) as usize;
         let symbol = info.indirect_undef_symbols[idx].as_deref().unwrap();
+
+        if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
+            if let Some(&addr) = bins
+                .iter()
+                .find_map(|dylib| dylib.exported_symbols.get(symbol))
+            {
+                let (stub_function_ptr, la_symbol_ptr) = link_by_restoring_stub(
+                    mem,
+                    cpu,
+                    addr,
+                    svc_pc,
+                    info.entry_size,
+                    pic_offset,
+                );
+                log!(
+                    "Linked guest C++ ABI symbol {} from a bundled dylib at {:?}/{:?}",
+                    symbol,
+                    stub_function_ptr,
+                    la_symbol_ptr
+                );
+                return None;
+            }
+        }
 
         if let Some(&addr) = self.non_lazy_host_functions.get(symbol) {
             // The host function was already linked non-lazily, point the
@@ -1815,10 +1915,14 @@ impl Dyld {
     /// guest's real unwinder (see `cxxabi_throw_intercept`). Returns the
     /// linked host stub, or `None` if `name` isn't intercepted.
     fn cxxabi_intercept(&mut self, mem: &mut Mem, name: &str) -> Option<GuestFunction> {
-        if name != "__cxa_throw" {
+        if self.guest_sjlj_runtime_available {
             return None;
         }
-        let sym: &'static str = "__cxa_throw";
+        let sym: &'static str = match name {
+            "__cxa_throw" => "__cxa_throw",
+            "___cxa_throw" => "___cxa_throw",
+            _ => return None,
+        };
         if let Some(&cached) = self.non_lazy_host_functions.get(sym) {
             return Some(cached);
         }
@@ -1931,4 +2035,63 @@ fn dyld_stub_binder(_env: &mut Environment, _arg: u32) {
 /// `int`/`uid_t`/`pid_t`/pointer return types.
 fn unimplemented_function_stub(_env: &mut Environment) -> i32 {
     0
+}
+
+fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
+    has_symbol("___cxa_throw")
+        && has_symbol("___gxx_personality_sj0")
+        && has_symbol("__Unwind_SjLj_RaiseException")
+        && has_symbol("__Unwind_SjLj_Register")
+}
+
+fn is_guest_cxxabi_symbol(name: &str) -> bool {
+    name.starts_with("___cxa_")
+        || name.starts_with("__Unwind_")
+        || name.starts_with("___gxx_personality_")
+        || name.starts_with("__ZTVN10__cxxabiv1")
+        || name.starts_with("__ZTI")
+        || name.starts_with("__ZTS")
+}
+
+#[cfg(test)]
+mod cxxabi_runtime_detection_tests {
+    use super::has_guest_sjlj_runtime;
+
+    const REQUIRED_SYMBOLS: [&str; 4] = [
+        "___cxa_throw",
+        "___gxx_personality_sj0",
+        "__Unwind_SjLj_RaiseException",
+        "__Unwind_SjLj_Register",
+    ];
+
+    #[test]
+    fn guest_sjlj_runtime_requires_throw_personality_and_unwinder() {
+        assert!(has_guest_sjlj_runtime(|symbol| {
+            REQUIRED_SYMBOLS.contains(&symbol)
+        }));
+        for missing in REQUIRED_SYMBOLS {
+            assert!(!has_guest_sjlj_runtime(|symbol| {
+                REQUIRED_SYMBOLS
+                    .iter()
+                    .any(|candidate| *candidate != missing && *candidate == symbol)
+            }));
+        }
+    }
+
+    #[test]
+    fn guest_cxxabi_symbol_matcher_covers_unwind_and_rtti_symbols() {
+        use super::is_guest_cxxabi_symbol;
+
+        for symbol in [
+            "___cxa_throw",
+            "__Unwind_SjLj_RaiseException",
+            "___gxx_personality_sj0",
+            "__ZTVN10__cxxabiv117__class_type_infoE",
+            "__ZTIi",
+            "__ZTSi",
+        ] {
+            assert!(is_guest_cxxabi_symbol(symbol));
+        }
+        assert!(!is_guest_cxxabi_symbol("___objc_msgSend"));
+    }
 }

@@ -158,6 +158,11 @@ pub struct Environment {
     /// Tracks repeated UndefinedInstruction bypasses. See `debug_cpu_error`.
     udf_bypass_last: Option<(u32, u32)>,
     udf_bypass_count: u32,
+    /// Total number of UndefinedInstruction bypasses, independent of the call
+    /// site. Logging is keyed on this so a guest that cycles through many
+    /// different `(pc, lr)` pairs (each with a pair count of 1) cannot flood
+    /// the log with one "occurrence 1" line per pair. See `debug_cpu_error`.
+    udf_bypass_total: u32,
     /// Tracks consecutive UndefinedInstruction bypasses that all fake-return
     /// to the *same* LR, regardless of the faulting PC. This catches runaway
     /// loops where the faulting PC alternates between several bogus addresses
@@ -227,6 +232,40 @@ pub enum ThreadBlock {
 struct BinaryDependencyNode {
     name: String,
     dependencies: Vec<String>,
+}
+
+fn canonicalize_dylib_path(path: &str) -> String {
+    let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let canonical_name = match name {
+        "libstdc++.6.dylib" => "libstdc++.6.0.9.dylib",
+        "libz.1.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => "libz.1.2.3.dylib",
+        "libsqlite3.0.dylib" => "libsqlite3.dylib",
+        _ => name,
+    };
+    if directory.is_empty() {
+        canonical_name.to_owned()
+    } else {
+        format!("{directory}/{canonical_name}")
+    }
+}
+
+fn load_transitive_dependencies<T>(
+    roots: &[String],
+    mut load: impl FnMut(&str) -> Result<Option<(T, Vec<String>)>, String>,
+) -> Result<Vec<T>, String> {
+    let mut pending: VecDeque<String> = roots.iter().cloned().collect();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut loaded = Vec::new();
+    while let Some(path) = pending.pop_front() {
+        if !visited.insert(canonicalize_dylib_path(&path)) {
+            continue;
+        }
+        if let Some((binary, dependencies)) = load(&path)? {
+            pending.extend(dependencies);
+            loaded.push(binary);
+        }
+    }
+    Ok(loaded)
 }
 
 /// Topologically sorts the binary dylibs using Kahn's algorithm
@@ -624,47 +663,19 @@ impl Environment {
         .map_err(|e| format!("Could not load executable: {e}"))?;
         drop(executable_bytes);
 
-        let mut dylibs = Vec::new();
-        let mut pending_dylibs: VecDeque<String> =
-            executable.dynamic_libraries.iter().cloned().collect();
-        let mut seen_dylibs = HashSet::new();
-        while let Some(dylib) = pending_dylibs.pop_front() {
-            if !seen_dylibs.insert(dylib.clone()) {
-                continue;
-            }
-
-            // There are some Free Software libraries bundled with touchHLE and
-            // exposed via the guest file system (see Fs::new()).
-            let dylib_path = fs::GuestPath::new(&dylib);
+        let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
+            let dylib_path = fs::GuestPath::new(dylib);
             if fs.is_file(dylib_path) {
-                // We use hardcoded slide values for libgcc and libstdc++
-                // based on base addresses of those dylibs prior to iOS 3.1
-                // TODO: implement some kind of ASLR instead of hardcoding
                 assert!(dylib_path.as_str().starts_with("/usr/lib/"));
-
                 let name = dylib_path.file_name().unwrap();
                 let dylib_slide = match name {
                     "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
-
-                    // ДОБАВИТЬ ЭТО: Честный базовый адрес для libc++ (iOS 5.0+)
                     "libc++.1.dylib" => 0x38000000,
-                    // На случай, если игра также потянет за собой libc++abi
                     "libc++abi.dylib" => 0x38100000,
                     "libiconv.2.dylib" => 0x32000000,
-
                     "libgcc_s.1.dylib" => 0x30000000,
-                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => {
-                        // We build `libz` from sources with our OSS toolchain,
-                        // the base address is already set and sliding is not
-                        // needed.
-                        0
-                    }
-                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => {
-                        // We build `libsqlite3` from sources with our OSS
-                        // toolchain, the base address is already set and
-                        // sliding is not needed.
-                        0
-                    }
+                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => 0,
+                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => 0,
                     _ => {
                         log!(
                             "Warning: unknown binary slide for {:?}; loading at slide 0. App may fail to bind some symbols.",
@@ -673,33 +684,33 @@ impl Environment {
                         0
                     }
                 };
-
-                let dylib = mach_o::MachO::load_from_file(
-                    dylib_path,
+                let binary = mach_o::MachO::load_from_file(
+                    fs::GuestPath::new(dylib),
                     &fs,
                     &mut mem,
                     dylib_slide,
                 )
                 .map_err(|e| format!("Could not load bundled dylib: {e}"))?;
-
-                pending_dylibs.extend(dylib.dynamic_libraries.iter().cloned());
-                dylibs.push(dylib);
-            // Otherwise, look for it in our host implementations.
-            } else if !crate::dyld::DYLIB_LIST
-                .iter()
-                .any(|d| d.path == dylib.as_str() || d.aliases.contains(&dylib.as_str()))
+                let dependencies = binary.dynamic_libraries.clone();
+                Ok(Some((binary, dependencies)))
+            } else {
+                let implemented_in_host = crate::dyld::DYLIB_LIST
+                    .iter()
+                    .any(|d| d.path == dylib || d.aliases.contains(&dylib));
                 // The Swift runtime dylibs are provided host-side by
                 // `dyld::swift_runtime` (all `__swift_*` entry points, type
                 // metadata slots and `__swift_FORCE_LOAD_$_*` autolink
                 // shims), so listing them here would be pure noise.
-                && !dylib.rsplit('/').next().unwrap_or(&dylib).starts_with("libswift")
-            {
-                log!(
-                    "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
-                    dylib
-                );
+                let is_swift = dylib.rsplit('/').next().unwrap_or(dylib).starts_with("libswift");
+                if !implemented_in_host && !is_swift {
+                    log!(
+                        "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
+                        dylib
+                    );
+                }
+                Ok(None)
             }
-        }
+        })?;
 
         let entry_point_addr = executable
             .entry_point_pc
@@ -925,6 +936,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -1091,6 +1103,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -1162,6 +1175,7 @@ impl Environment {
             panic_cell: Rc::new(Cell::new(None)),
             udf_bypass_last: None,
             udf_bypass_count: 0,
+            udf_bypass_total: 0,
             udf_bypass_last_lr: None,
             udf_bypass_lr_count: 0,
             guest_termination_requested: false,
@@ -2145,7 +2159,6 @@ impl Environment {
             if matches!(error, cpu::CpuError::UndefinedInstruction) {
                 let pc = self.cpu.regs()[cpu::Cpu::PC];
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
-
                 // Potato Story Android hard fallback:
                 //
                 // The generic decoder did not match on-device, but Android
@@ -2334,6 +2347,8 @@ impl Environment {
                     self.udf_bypass_count = 1;
                     1
                 };
+                self.udf_bypass_total = self.udf_bypass_total.saturating_add(1);
+                let total = self.udf_bypass_total;
 
                 // Independently track how many times in a row we've faked a
                 // return to the SAME LR, ignoring the faulting PC. The `(pc,
@@ -2376,7 +2391,10 @@ impl Environment {
                     );
                 }
 
-                if count == 1 || count % LOG_RATE == 0 {
+                // Log the first sight of each new bypass site, but keyed on
+                // the *total* count so guests that cycle through many distinct
+                // (PC, LR) pairs stop flooding the log after LOG_RATE lines.
+                if total <= LOG_RATE && (count == 1 || count % LOG_RATE == 0) {
                     log_no_panic!(
                         "Warning: Ignored UndefinedInstruction at {:#x}. \
                          Faking function return to LR ({:#x}) to bypass crash! \
@@ -2389,6 +2407,15 @@ impl Environment {
                         instruction_len,
                         count,
                         BYPASS_LIMIT
+                    );
+                } else if total == LOG_RATE + 1 {
+                    log_no_panic!(
+                        "Warning: Ignored UndefinedInstruction bypass still active \
+                         ({} total so far); suppressing further per-site lines until \
+                         a new call site appears. Latest PC {:#x}, LR {:#x}.",
+                        total,
+                        pc,
+                        lr
                     );
                 }
 
@@ -3364,6 +3391,45 @@ mod dylib_sorting_tests {
         assert!(
             result.is_err(),
             "Sort should detect self-dependency as a cycle and return an error"
+        );
+    }
+
+    #[test]
+    fn test_transitive_dependencies_and_aliases_are_loaded_once() {
+        let roots = vec![
+            "/usr/lib/libstdc++.6.dylib".to_owned(),
+            "/usr/lib/libstdc++.6.0.9.dylib".to_owned(),
+        ];
+        let mut visited = Vec::new();
+        let loaded = load_transitive_dependencies(&roots, |path| {
+            visited.push(path.to_owned());
+            let dependencies = match path {
+                "/usr/lib/libstdc++.6.dylib" | "/usr/lib/libstdc++.6.0.9.dylib" => {
+                    Some(vec!["/usr/lib/libgcc_s.1.dylib".to_owned()])
+                }
+                "/usr/lib/libgcc_s.1.dylib" => {
+                    Some(vec!["/usr/lib/libSystem.B.dylib".to_owned()])
+                }
+                _ => None,
+            };
+            Ok(dependencies.map(|dependencies| (path.to_owned(), dependencies)))
+        })
+        .unwrap();
+
+        assert_eq!(
+            loaded,
+            vec![
+                "/usr/lib/libstdc++.6.dylib".to_owned(),
+                "/usr/lib/libgcc_s.1.dylib".to_owned(),
+            ]
+        );
+        assert_eq!(
+            visited,
+            vec![
+                "/usr/lib/libstdc++.6.dylib".to_owned(),
+                "/usr/lib/libgcc_s.1.dylib".to_owned(),
+                "/usr/lib/libSystem.B.dylib".to_owned(),
+            ]
         );
     }
 }

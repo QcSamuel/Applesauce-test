@@ -152,4 +152,10 @@ macro_rules! echo_no_panic {
 // run-loop time it needs to dispatch touches: the app still renders and still
 // hit-tests, but -[UIApplication sendEvent:] stops being called and no touch
 // ever reaches SDL or the on-screen controls.
+//
+// Upstream trunk currently ships this non-empty (enabling
+// "touchHLE::frameworks::media_player::movie_player" while the new movie
+// player is being actively debugged against BioShock). Re-enable that
+// temporarily on a desktop debug build if you need the same tracing, but
+// don't let it reach a device build.
 pub const ENABLED_MODULES: &[&str] = &[];

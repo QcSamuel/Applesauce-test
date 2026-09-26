@@ -78,7 +78,11 @@ const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 /// rendering with shader entry points (`glUseProgram`, `glCreateShader`, …)
 /// route through the real native ES 2.0 backend instead of falling through
 /// to the GLES 1.1-only stubs in `gles_generic`.
-fn effective_eagl_api(requested: EAGLRenderingAPI, prefer_gles2_context: bool) -> EAGLRenderingAPI {
+fn effective_eagl_api(
+    requested: EAGLRenderingAPI,
+    prefer_gles2_context: bool,
+    force_gles1_context: bool,
+) -> EAGLRenderingAPI {
     // Hardcoded driver pin: TOUCHHLE_FORCE_EAGL_API forces the reported/
     // effective EAGL rendering API (1, 2 or 3) regardless of what the guest
     // app requested. This pins the GPU driver surface the app sees, mirroring
@@ -95,6 +99,14 @@ fn effective_eagl_api(requested: EAGLRenderingAPI, prefer_gles2_context: bool) -
                 return v;
             }
         }
+    }
+    if force_gles1_context && requested != kEAGLRenderingAPIOpenGLES1 {
+        log!(
+            "EAGL: --force-gles1-context active, downgrading initWithAPI:{} (kEAGLRenderingAPIOpenGLES{}) to kEAGLRenderingAPIOpenGLES1",
+            requested,
+            requested
+        );
+        return kEAGLRenderingAPIOpenGLES1;
     }
     if prefer_gles2_context && requested == kEAGLRenderingAPIOpenGLES1 {
         log!(
@@ -139,6 +151,11 @@ pub(super) struct GLShadowState {
     /// Draw-call guards for generic vertex attributes are skipped entirely
     /// for the (very common) fixed-function-only apps that never use them.
     pub(super) generic_attribs_used: bool,
+    /// Programs for which the guest app explicitly bound attribute locations
+    /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
+    /// must not force-rebind canonical attribute names, because that would
+    /// override the app's own vertex layout (e.g. Gameloft's Jet engine).
+    pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -150,6 +167,7 @@ impl Default for GLShadowState {
             fog_start: 0.0,
             fog_end: 1.0,
             generic_attribs_used: false,
+            guest_bound_attribs: HashMap::new(),
         }
     }
 }
@@ -189,11 +207,6 @@ pub(super) struct EAGLContextHostObject {
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
     pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
-    /// Programs for which the guest app explicitly bound attribute locations
-    /// via `glBindAttribLocation` before linking. For these, `glLinkProgram`
-    /// must not force-rebind canonical attribute names, because that would
-    /// override the app's own vertex layout (e.g. Gameloft's Jet engine).
-    pub guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
 }
 impl HostObject for EAGLContextHostObject {}
 
@@ -245,7 +258,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         fps_counter: None,
         next_frame_due: None,
         mapped_buffers: HashMap::new(),
-        guest_bound_attribs: HashMap::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -301,7 +313,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     env.window.as_mut().unwrap().set_share_with_current_context(true);
 
-    let effective_api = effective_eagl_api(api, env.options.prefer_gles2_context);
+    let effective_api = effective_eagl_api(
+        api,
+        env.options.prefer_gles2_context,
+        env.options.force_gles1_context,
+    );
 
     let mut gles_ins = match effective_api {
         kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
@@ -346,7 +362,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
-    let effective_api = effective_eagl_api(api, env.options.prefer_gles2_context);
+    let effective_api = effective_eagl_api(
+        api,
+        env.options.prefer_gles2_context,
+        env.options.force_gles1_context,
+    );
 
     let mut gles_ins = match effective_api {
         kEAGLRenderingAPIOpenGLES3 => create_gles3_ctx(env),
@@ -783,6 +803,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                 n
             );
         }
+        if n == 3000 && crate::env_flag_cached!("TOUCHHLE_TRACE_FRAME_CALLS") {
+            crate::dyld::TRACE_HOST_CALLS.store(400, Ordering::Relaxed);
+        }
     }
 
     if target != gles11::RENDERBUFFER_OES {
@@ -844,15 +867,58 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     std::mem::drop(gles);
 
-    let Some(&drawable) = env
+    let bindings: Vec<(GLuint, id)> = env
         .objc
         .borrow::<EAGLContextHostObject>(this)
         .renderbuffer_drawable_bindings
         .borrow()
-        .get(&renderbuffer) else {
-        log_dbg!("Can't present a renderbuffer {:?} not bound to a drawable!", renderbuffer);
-        return false;
+        .iter()
+        .map(|(&rb, &drawable)| (rb, drawable))
+        .collect();
+
+    // The renderbuffer reported by the driver must be the drawable's colour
+    // renderbuffer, and that is what gets keyed in the map. Some engines
+    // (cocos2d 2.x, e.g. Geometry Dash) leave a different binding current
+    // around presentRenderbuffer:, which makes the driver-reported id miss
+    // the map — on iOS the renderbuffer attached to the drawable is still
+    // presented, so fall back to the single registered binding instead of
+    // silently dropping the frame (the silent drop manifests as a permanent
+    // black screen).
+    let drawable = match bindings.iter().find(|(rb, _)| *rb == renderbuffer) {
+        Some(&(_, drawable)) => drawable,
+        None => {
+            if bindings.len() == 1 {
+                let (rb, drawable) = bindings[0];
+                {
+                    static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+                    MISMATCH_LOGGED.call_once(|| {
+                        log!(
+                            "[EAGLContext presentRenderbuffer:] renderbuffer binding \
+                             mismatch: driver reports {:#x}, drawable is bound to \
+                             {:#x}; presenting the bound drawable anyway. \
+                             [this log will only be shown once]",
+                            renderbuffer,
+                            rb
+                        );
+                    });
+                }
+                drawable
+            } else {
+                log!(
+                    "Warning: can't present a renderbuffer {:#x} not bound to a \
+                     drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
+                    renderbuffer,
+                    bindings.len(),
+                    bindings.iter().map(|(rb, _)| *rb).collect::<Vec<_>>(),
+                );
+                if let Some(frame_due) = frame_due {
+                    pace_frame(env, frame_due);
+                }
+                return false;
+            }
+        }
     };
+    drop(bindings);
 
     let use_ios_es2_direct_path = cfg!(target_os = "ios")
         && env.options.ios_es2_direct_present
@@ -909,8 +975,16 @@ pub const CLASSES: ClassExports = objc_classes! {
             // (its glDrawArrays is the fixed-function emulation itself), so
             // it keeps using readback unless explicitly overridden.
             PresentMode::Auto => {
+                // Native ES 1.1 games keep the readback presenter by default.
+                // The GPU-copy path changes guest-visible fixed-function state
+                // in ways 2D engines (cocos2d etc.) notice — sprite
+                // blending/tinting breaks even though the frame is not black,
+                // so the automatic black-frame fallback never triggers. ES 2.0
+                // backends keep the fast GPU path (its save/restore is exact,
+                // and that is where the 3D games live).
                 backend_is_translator
-                    || (backend_is_native_es1 && direct_present_is_broken())
+                    || backend_is_native_es1
+                    || (backend_is_es2 && direct_present_is_broken())
             }
         };
         {
@@ -976,11 +1050,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         // copied back to system RAM, and then will have to be copied to VRAM
         // again during composition. find_fullscreen_eagl_layer() exists to
         // avoid this.
-        log_dbg!(
-            "There is no fullscreen layer, presenting renderbuffer {:?} to layer {:?} by copying to RAM (slow path).",
-            renderbuffer,
-            drawable,
-        );
+        {
+            static SLOW_PATH_LOGGED: std::sync::Once = std::sync::Once::new();
+            SLOW_PATH_LOGGED.call_once(|| {
+                log!(
+                    "EAGL presenter: no fullscreen layer found; presenting renderbuffer \
+                     {:#x} to layer {:?} via RAM readback (slow path). [this log will \
+                     only be shown once]",
+                    renderbuffer,
+                    drawable
+                );
+            });
+        }
         let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
         // re-borrow
         let read_result = {
@@ -1010,6 +1091,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
             return false;
         };
+        dump_readback_ppm(&pixels_vec, width, height);
         present_pixels(env, drawable, pixels_vec, width, height);
 
         // The slow path stores the freshly rendered frame in `presented_pixels`
@@ -1043,6 +1125,42 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
+/// Dump one renderbuffer readback to a PPM for black-screen diagnosis
+/// (env var gated, as this is a developer-only diagnostic).
+fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    if !crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK") {
+        return;
+    }
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    // Dump at several points in the session: the first frame can legitimately
+    // be black (loading screen), so also sample later frames.
+    let targets = [0u32, 60, 300, 600, 1200, 2400];
+    let Some(idx) = targets.iter().position(|&t| t == n) else {
+        return;
+    };
+    let header = format!("P6\n{} {}\n255\n", width, height);
+    let mut out = header.into_bytes();
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for px in pixels.chunks_exact(4) {
+        // read_renderbuffer gives RGBA8; PPM wants RGB.
+        rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+    }
+    out.extend_from_slice(&rgb);
+    let path = format!("/tmp/a8run/readback_f{}.ppm", targets[idx]);
+    match std::fs::write(&path, &out) {
+        Ok(()) => log!(
+            "Dumped renderbuffer readback #{} ({}x{}) to {}",
+            n,
+            width,
+            height,
+            path
+        ),
+        Err(e) => log!("Failed to dump readback to {}: {}", path, e),
+    }
+}
+
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
@@ -1063,34 +1181,7 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         log!("Native ES1 readback skipped because the GL context disappeared.");
         return;
     };
-    // Dump the first readback to a PPM for black-screen diagnosis (env var
-    // gated, as this is a developer-only diagnostic).
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static DUMPED: AtomicBool = AtomicBool::new(false);
-        if crate::env_flag_cached!("TOUCHHLE_DUMP_READBACK")
-            && !DUMPED.swap(true, Ordering::Relaxed)
-        {
-            let path = "/tmp/a8run/readback.ppm";
-            let header = format!("P6\n{} {}\n255\n", width, height);
-            let mut out = header.into_bytes();
-            let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-            for px in pixels.chunks_exact(4) {
-                // read_renderbuffer gives RGBA8; PPM wants RGB.
-                rgb.extend_from_slice(&[px[0], px[1], px[2]]);
-            }
-            out.extend_from_slice(&rgb);
-            match std::fs::write(path, &out) {
-                Ok(()) => log!(
-                    "Dumped first renderbuffer readback ({}x{}) to {}",
-                    width,
-                    height,
-                    path
-                ),
-                Err(e) => log!("Failed to dump readback to {}: {}", path, e),
-            }
-        }
-    }
+    dump_readback_ppm(&pixels, width, height);
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
     env.options.force_composition = true;
@@ -1490,6 +1581,12 @@ unsafe fn present_renderbuffer_es2(
         if present_finish {
             gles.Finish();
         }
+        // The guest's scissor test clips glCopyTexSubImage2D readouts the
+        // same way it clips the ES 1.1 path's copies (2D engines that keep
+        // scissor enabled at present time produce glitched frames). Save the
+        // enable state, copy with the test disabled, restore.
+        let es2_scissor_was_on = gles.IsEnabled(gles2::SCISSOR_TEST) != 0;
+        gles.Disable(gles2::SCISSOR_TEST);
         gles.ActiveTexture(gles2::TEXTURE0);
         gles.BindTexture(gles2::TEXTURE_2D, present_objects.texture);
         let texture_size = PRESENT_TEXTURE_SIZE.with(|cell| cell.get());
@@ -1517,6 +1614,9 @@ unsafe fn present_renderbuffer_es2(
             width,
             height,
         );
+        if es2_scissor_was_on {
+            gles.Enable(gles2::SCISSOR_TEST);
+        }
         gles.BindFramebuffer(gles2::FRAMEBUFFER, old_framebuffer as _);
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| {
@@ -2409,6 +2509,11 @@ unsafe fn present_renderbuffer(
     // To avoid confusing the guest app, we need to be able to undo any
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
+    let old_active_texture: GLuint = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
+    // The present texture must be bound on unit 0: the guest may have left a
+    // different unit active, and binding to it would both draw the present
+    // quad with the wrong texture and corrupt the guest's unit binding.
+    gles.ActiveTexture(gles11::TEXTURE0);
     let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2557,9 +2662,48 @@ unsafe fn present_renderbuffer(
     // presenter can do on a tile-based GPU (it serialises CPU and GPU and
     // defeats the driver's frame pipelining), so it is opt-in now:
     // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
-    if options.present_finish {
+    // Tile-based GPUs resolve the app's draws to the renderbuffer's main
+    // memory at well-defined sync points. CopyTex(Sub)Image2D is spec-ordered
+    // after the app's draws, but real ES 1.1 surfaces (Adreno/Mali, native or
+    // over ANGLE) have historically needed an explicit drain for alpha-blended
+    // 2D scenes (many small quads): without it, the copy can race the tile
+    // resolve and produce partially-drawn / garbled frames, while 3D scenes
+    // (few big depth-tested draws) usually happen to be fine. Keep the full
+    // drain as the default on native ES 1.1 backends (it was unconditional
+    // before the GPU-present rework); on ES 2.0 shader backends the resolve
+    // is reliable, so it stays opt-in there.
+    let native_es1 = gles.is_native_es1();
+    let finish_before_copy = options.present_finish
+        || (native_es1 && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
+    if finish_before_copy && !options.present_finish {
+        log_once!(
+            "EAGL presenter: native ES1.1 backend - forcing glFinish before the \
+             renderbuffer copy (tile-resolve safety for 2D alpha-blended games; \
+             opt out with TOUCHHLE_NO_PRESENT_FINISH=1)."
+        );
+    }
+    if finish_before_copy {
         gles.Finish();
     }
+    // A guest that renders 2D UI (level-select lists, HUD panels, ...) very
+    // commonly leaves GL_SCISSOR_TEST enabled at present time — iOS titles
+    // never notice because iOS's own present path ignores scissor when
+    // resolving the drawable. Our CopyTex(Sub)Image2D readout is NOT
+    // ignored: pixels outside the guest's scissor box are never copied, so
+    // every frame would present only the scissored sub-region while the
+    // rest of the texture keeps stale content from older frames (the
+    // "Geometry Dash glitched frame" symptom). Disable the test for the
+    // copy; the generic caps save/restore loop below puts the enable flag
+    // back for the guest after the present quad.
+    let old_scissor_box: [GLint; 4] = get_ints(gles, gles11::SCISSOR_BOX);
+    gles.Disable(gles11::SCISSOR_TEST);
+    // Same story for the pack alignment: glCopyTex(Sub)Image2D reads rows
+    // with GL_PACK_ALIGNMENT, and a guest that uploaded odd-stride data
+    // with a non-default alignment skews every copied row and mangles the
+    // presented image. RGBA8 rows are always 4-byte aligned, so alignment
+    // 1 is always valid here and never changes the image.
+    let old_pack_alignment: GLint = get_int(gles, gles11::PACK_ALIGNMENT);
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
@@ -2596,6 +2740,17 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
+    // Restore the guest's pixel-store state now that the copy is done; the
+    // scissor box is restored too so a guest that reads pixels itself
+    // (screenshots) is unaffected. The scissor TEST stays disabled until
+    // the generic caps restore loop re-enables it after the present quad.
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
+    gles.Scissor(
+        old_scissor_box[0],
+        old_scissor_box[1],
+        old_scissor_box[2],
+        old_scissor_box[3],
+    );
     // Black-frame detector, part 1: sample the source while the framebuffer
     // we copied from is still bound.
     let probe_source_max = if probe_active {
@@ -3184,8 +3339,11 @@ unsafe fn present_renderbuffer(
         );
     }
 
-    // Restore the other bindings
+    // Restore the other bindings. The present texture was bound on unit 0
+    // (see the ActiveTexture switch at the top), so restore both the unit
+    // and the texture binding.
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
+    gles.ActiveTexture(old_active_texture);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

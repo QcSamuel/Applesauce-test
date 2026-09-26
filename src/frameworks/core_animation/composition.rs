@@ -221,6 +221,32 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         host_framebuffer
     };
 
+    // The compositor shares the GL context with the guest app, but on real
+    // iOS Core Animation composites on its own render queue: the app's GL
+    // state (buffer bindings in particular) is never disturbed. The guest
+    // relies on that — cocos2d-style engines bind a vertex/index VBO once
+    // during initialisation and then pass pointer *offsets* every frame
+    // without re-binding. Saving and restoring the bindings here keeps that
+    // assumption valid, and keeps the guest-visible GLShadowState mirror
+    // (see eagl::GLShadowState) consistent with the driver: leaving both
+    // bindings at 0 (the old behaviour) made the next gl*Pointer(offset)
+    // call be classified as a client pointer while the app meant it as an
+    // offset into its still-bound VBO — sprite geometry then read garbage
+    // and 2D games rendered only their clear colour.
+    let mut saved_array_buffer: GLint = 0;
+    let mut saved_element_array_buffer: GLint = 0;
+    unsafe {
+        gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut saved_array_buffer);
+        // Swallow errors: some strict drivers reject individual binding
+        // queries, and a wrong "0" only degrades to the old behaviour.
+        let _ = gles.GetError();
+        gles.GetIntegerv(
+            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
+            &mut saved_element_array_buffer,
+        );
+        let _ = gles.GetError();
+    }
+
     // Set up GL objects needed for render-to-texture. We could draw directly
     // to the screen instead, but this way we can reuse the code for scaling and
     // rotating the screen and drawing the virtual cursor.
@@ -470,6 +496,51 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
     std::mem::drop(gles);
 
+    if crate::env_flag_cached!("TOUCHHLE_DUMP_LAYER_TREE") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
+            fn dump(env: &Environment, layer: id, depth: usize) {
+                let h = env.objc.borrow::<CALayerHostObject>(layer);
+                let delegate: id = h.delegate_for_debug();
+                let cls = |o: id| -> String {
+                    if o == nil {
+                        "nil".into()
+                    } else {
+                        let c = crate::objc::ObjC::read_isa(o, &env.mem);
+                        env.objc.get_class_name(c).to_string()
+                    }
+                };
+                log!(
+                    "LAYER {:indent$}{} ({:?}) delegate={} bounds={:?} pos={:?} hidden={} opaque={} opacity={} bg={:?} contents={} pixels={} ctx={}",
+                    "",
+                    cls(layer),
+                    layer,
+                    cls(delegate),
+                    h.bounds,
+                    h.position,
+                    h.hidden,
+                    h.opaque,
+                    h.opacity,
+                    h.background_color.map(|c| (c.r, c.g, c.b, c.a)),
+                    h.contents != nil,
+                    h.presented_pixels.as_ref().map(|p| (p.1, p.2)).is_some(),
+                    h.cg_context.is_some(),
+                    indent = depth * 2
+                );
+                for &s in &h.sublayers {
+                    dump(env, s, depth + 1);
+                }
+            }
+            for &root in &window_layers {
+                dump(env, root, 0);
+            }
+            for (i, t) in env.threads.iter().enumerate() {
+                log!("THREAD {} current={} {:?}", i, i == env.current_thread, t);
+            }
+        }
+    }
+
     // Assumes the windows in the list are ordered back-to-front.
     // TODO: this may not be correct once we support windowLevel.
     for root_layer in window_layers {
@@ -517,6 +588,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.1,
             present_frame_args.2,
         );
+        // Hand the context back to the guest with the buffer bindings it
+        // left behind (see the save at the top of this function).
+        gles.BindBuffer(gles11::ARRAY_BUFFER, saved_array_buffer as _);
+        gles.BindBuffer(
+            gles11::ELEMENT_ARRAY_BUFFER,
+            saved_element_array_buffer as _,
+        );
+        let _ = gles.GetError();
     }
     std::mem::drop(gles);
     window.swap_window();

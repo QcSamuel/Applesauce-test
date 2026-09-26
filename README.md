@@ -16,6 +16,10 @@ built around them — the interface, the build system and the packaging. Neither
 project is connected to Applesauce or endorses it, so please report problems
 here rather than to them. No games or Apple software are included.
 
+The HyperHLE core bundled here tracks upstream's `trunk`, which includes:
+* GPU/GLES compatibility work: shader translation fixes, texture format handling, EAGL/Core Animation composition fixes against black screens.
+* Additional implemented iPhone OS framework APIs to get more real apps running.
+
 **One app, two emulator cores.** They support different sets of games, so both
 ship inside the app and you choose which one runs each game:
 

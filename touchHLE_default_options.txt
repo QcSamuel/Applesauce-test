@@ -290,7 +290,7 @@ com.StarByte.NEX: --landscape-left --force-composition
 
 # BioShock (requires a newer device model; the game refuses to start its
 # engine if it detects an unsupported device like the original iPhone)
-com.2k.bioshock: --landscape-right --device-family=iphone5
+com.2k.bioshock: --landscape-right --device-family=iphone-5c
 
 # Galaxy on Fire
 # In Game controls A = Weapon Select, X = Boost, B = Fire, Y = Missle, Start = Pause
@@ -311,6 +311,14 @@ at.source.tomzom: --device-family=iphone --force-composition
 at.source.potpan: --device-family=iphone --landscape-right --force-composition
 at.source.potato3D: --device-family=iphone --landscape-right --force-composition
 com.tayasui.mrpoofree: --device-family=iphone --landscape-right --fullscreen --force-composition
+
+# Scarface
+# The game runs in landscape-right and writes to its own bundle (osres.sok,
+# tricky.sok, console_startup.txt).  Copy-on-Write in fs.rs handles the
+# writes; --landscape-right fixes the orientation; --force-composition
+# prevents render artefacts on Adreno drivers.
+com.go.starwave.scarface: --landscape-right --force-composition
+
 # Hack, Slash, Loot (iPad)
 # Landscape iPad title; its first menu is rendered by the fixed-function GLES 1.1 path.
 com.DavidWilliamson.HackSlashLootiPad: --landscape-left --device-family=ipad --gles1=gles1_on_gl2
@@ -341,3 +349,8 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # black screen. The direct presenter costs a readback every frame, so it stays
 # opt-in and is enabled per app here.
 com.ea.simsmedieval.bv: --ios-es2-direct-present
+
+# LEGO Ninjago: The Final Battle
+# Uses OpenAL streaming audio; keep its fixed-function landscape profile and
+# force the compatibility texture filter on strict mobile GLES drivers.
+com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter

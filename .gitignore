@@ -51,4 +51,4 @@ DUMP.txt
 *.log
 touchHLE_apps/
 target/
-*.ipa
+touchHLE_pvrtc_cache/

@@ -29,6 +29,8 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
           
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
@@ -117,6 +119,8 @@ jobs:
         uses: actions/checkout@main
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install Linux build dependencies
         # SDL2 and openal-soft are built from source (the `static` feature uses
@@ -187,6 +191,8 @@ jobs:
       uses: actions/checkout@main
       with:
         submodules: recursive
+        fetch-depth: 0
+        fetch-tags: true
 
     - name: Cache Rust build artifacts
       uses: actions/cache@main
@@ -272,15 +278,18 @@ jobs:
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties  
 
     - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/app-release.apk ../touchHLE.apk  
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Fork-release.apk ../HyperHLE-Fork.apk  
       env:  
+        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
+        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
+        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
         ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
         CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake  
 
     - uses: actions/upload-artifact@main
       with:  
         name: HyperHLE_Android_AArch64  
-        path: touchHLE.apk
+        path: HyperHLE-Fork.apk
 
   build-win:
     runs-on: windows-2022  
@@ -341,6 +350,7 @@ jobs:
         uses: actions/checkout@main
         with:
           fetch-depth: 0
+          fetch-tags: true
       - name: Check whether a HyperHLE release is due
         id: check
         env:
@@ -365,6 +375,7 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+          fetch-tags: true
       - name: Download macOS artifact
         uses: actions/download-artifact@main
         with:
